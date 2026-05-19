@@ -6,120 +6,345 @@
 <title>TradeLog — Tvůj trading journal</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=Sora:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+
+<!-- Firebase SDK — CDN verze pro čisté HTML bez bundleru -->
+<script type="module" id="fb-module">
+// ══════════════════════════════════════════════
+//  🔥 FIREBASE CONFIG
+//  Vyplň po vytvoření projektu na console.firebase.google.com
+//  Projekt → Nastavení → Webová aplikace → SDK snippet
+//
+//  Firestore pravidla (Firebase Console → Firestore → Rules):
+//  rules_version = '2';
+//  service cloud.firestore {
+//    match /databases/{database}/documents {
+//      match /users/{userId}/{document=**} {
+//        allow read, write: if request.auth != null && request.auth.uid == userId;
+//      }
+//    }
+//  }
+// ══════════════════════════════════════════════
+const FIREBASE_CONFIG = {
+  apiKey:            "VLOZ_API_KEY",
+  authDomain:        "VLOZ_AUTH_DOMAIN",
+  projectId:         "VLOZ_PROJECT_ID",
+  storageBucket:     "VLOZ_STORAGE_BUCKET",
+  messagingSenderId: "VLOZ_MESSAGING_SENDER_ID",
+  appId:             "VLOZ_APP_ID"
+};
+
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword,
+         createUserWithEmailAndPassword,
+         signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore,
+         collection, doc,
+         getDocs, getDoc, setDoc, addDoc,
+         deleteDoc, writeBatch, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const READY = !FIREBASE_CONFIG.apiKey.startsWith('VLOZ');
+
+if(READY){
+  const app  = initializeApp(FIREBASE_CONFIG);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  // ── AUTH ──────────────────────────────────────────
+  window._fbAuth    = auth;
+  window._fbSignIn  = (email, pass) => signInWithEmailAndPassword(auth, email, pass);
+  window._fbSignUp  = (email, pass) => createUserWithEmailAndPassword(auth, email, pass);
+  window._fbSignOut = ()            => signOut(auth);
+
+  // ── FIRESTORE HELPERS ─────────────────────────────
+  // Cesty: users/{uid}/accounts, users/{uid}/trades
+  const userRef  = uid => doc(db, 'users', uid);
+  const accCol   = uid => collection(db, 'users', uid, 'accounts');
+  const accDoc   = (uid, aid) => doc(db, 'users', uid, 'accounts', aid);
+  const tradeCol = uid => collection(db, 'users', uid, 'trades');
+  const tradeDoc = (uid, tid) => doc(db, 'users', uid, 'trades', tid);
+
+  // Načti accounts pro uživatele
+  window._fbLoadAccounts = async (uid) => {
+    const snap = await getDocs(accCol(uid));
+    return snap.docs.map(d => ({ _fid: d.id, ...d.data() }));
+  };
+
+  // Ulož jeden account (vytvoř nebo přepiš)
+  window._fbSaveAccount = async (uid, account) => {
+    const id = account._fid || account.id;
+    await setDoc(accDoc(uid, id), {
+      id:    account.id,
+      name:  account.name,
+      color: account.color,
+    }, { merge: true });
+  };
+
+  // Smaž account a všechny jeho trades
+  window._fbDeleteAccount = async (uid, accountId) => {
+    // Smaž account dokument
+    await deleteDoc(accDoc(uid, accountId));
+    // Smaž všechny trades tohoto accountu (batch)
+    const snap = await getDocs(tradeCol(uid));
+    const batch = writeBatch(db);
+    snap.docs
+      .filter(d => d.data().account === accountId)
+      .forEach(d => batch.delete(d.ref));
+    await batch.commit();
+  };
+
+  // Načti všechny trades uživatele
+  window._fbLoadTrades = async (uid) => {
+    const snap = await getDocs(tradeCol(uid));
+    return snap.docs.map(d => ({ _fid: d.id, ...d.data() }));
+  };
+
+  // Ulož jeden trade (nový nebo update)
+  window._fbSaveTrade = async (uid, trade) => {
+    if(trade._fid){
+      // Update existujícího
+      const { _fid, ...data } = trade;
+      await setDoc(tradeDoc(uid, _fid), { ...data, userId: uid, updatedAt: serverTimestamp() }, { merge: true });
+      return trade._fid;
+    } else {
+      // Nový trade
+      const ref = await addDoc(tradeCol(uid), { ...trade, userId: uid, createdAt: serverTimestamp() });
+      return ref.id;
+    }
+  };
+
+  // Smaž trade
+  window._fbDeleteTrade = async (uid, trade) => {
+    if(trade._fid) await deleteDoc(tradeDoc(uid, trade._fid));
+  };
+
+  // Ulož všechny trades najednou (bulk - pro import)
+  window._fbSaveAllTrades = async (uid, tradesList) => {
+    const batch = writeBatch(db);
+    tradesList.forEach(trade => {
+      const { _fid, ...data } = trade;
+      const ref = _fid ? tradeDoc(uid, _fid) : doc(tradeCol(uid));
+      batch.set(ref, { ...data, userId: uid }, { merge: true });
+    });
+    await batch.commit();
+  };
+
+  // Ulož rules (jako jeden dokument)
+  window._fbSaveRules = async (uid, rulesList) => {
+    await setDoc(doc(db, 'users', uid, 'settings', 'rules'), { rules: rulesList }, { merge: true });
+  };
+
+  // Načti rules
+  window._fbLoadRules = async (uid) => {
+    const snap = await getDoc(doc(db, 'users', uid, 'settings', 'rules'));
+    return snap.exists() ? (snap.data().rules || []) : [];
+  };
+
+  // ── AUTH STATE ────────────────────────────────────
+  onAuthStateChanged(auth, user => {
+    if(user){
+      window._fbCurrentUid = user.uid;
+      window._fbOnLogin(user);
+    } else {
+      window._fbCurrentUid = null;
+      window._fbOnLogout();
+    }
+  });
+
+} else {
+  // Firebase config nevyplněn — lokální mock
+  window._fbCurrentUid  = null;
+  window._fbAuth        = null;
+  window._fbSignIn = window._fbSignUp = window._fbSignOut = null;
+  window._fbLoadAccounts = window._fbSaveAccount = window._fbDeleteAccount = null;
+  window._fbLoadTrades   = window._fbSaveTrade   = window._fbDeleteTrade   = null;
+  window._fbSaveAllTrades = window._fbSaveRules  = window._fbLoadRules     = null;
+
+  document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('fb-banner').style.display = 'flex';
+    window._localAuthFallback();
+  });
+}
+</script>
+
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 :root{
-  --bg:#0b0c0f;--bg2:#111318;--bg3:#16181f;--bg4:#1c1e27;
-  --border:#252830;--border2:#2e3140;
-  --accent:#6c63ff;--accent2:#4ecca3;--accent3:#f9a03f;
-  --red:#ff4d4f;--green:#3ecf8e;
-  --text:#e8eaf0;--text2:#9296a8;--text3:#5a5e70;
-  --r:12px;--font:'Sora',sans-serif;--mono:'DM Mono',monospace;
+  --bg:#080909;
+  --bg2:#0e1014;
+  --bg3:#14171d;
+  --bg4:#1a1d24;
+  --border:#1e2128;
+  --border2:#272b35;
+  --accent:#7c6ffc;
+  --accent2:#4ecba3;
+  --accent3:#f0a030;
+  --red:#f04f50;
+  --green:#3ecf8e;
+  --text:#eceef2;
+  --text2:#8a8fa8;
+  --text3:#494e63;
+  --r:14px;
+  --r-sm:10px;
+  --font:'Sora',sans-serif;
+  --mono:'DM Mono',monospace;
+  --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.25);
+  --shadow-lg:0 8px 32px rgba(0,0,0,.4),0 2px 8px rgba(0,0,0,.3);
 }
+
+/* ── LIGHT THEME ─────────────────────────────────────── */
+[data-theme="light"]{
+  --bg:#f4f5f7;
+  --bg2:#ffffff;
+  --bg3:#f0f1f4;
+  --bg4:#e8eaee;
+  --border:#e2e4ea;
+  --border2:#d0d3dc;
+  --accent:#6355e8;
+  --accent2:#0ea97a;
+  --accent3:#d97706;
+  --red:#dc2626;
+  --green:#059669;
+  --text:#111318;
+  --text2:#4b5068;
+  --text3:#9299b0;
+  --shadow:0 1px 3px rgba(0,0,0,.08),0 4px 16px rgba(0,0,0,.06);
+  --shadow-lg:0 8px 32px rgba(0,0,0,.1),0 2px 8px rgba(0,0,0,.06);
+}
+
+/* Light theme specifické overrides */
+[data-theme="light"] .sidebar{background:var(--bg2);border-right:1px solid var(--border);}
+[data-theme="light"] .topbar{background:var(--bg2);}
+[data-theme="light"] .modal-box{background:var(--bg2);}
+[data-theme="light"] .login-box{background:var(--bg2);}
+[data-theme="light"] .trade-card{background:var(--bg2);}
+[data-theme="light"] .pb-card{background:var(--bg2);}
+[data-theme="light"] .note-card{background:var(--bg2);}
+[data-theme="light"] .tag-card{background:var(--bg2);}
+[data-theme="light"] .acc-page-card{background:var(--bg2);}
+[data-theme="light"] .sc{background:var(--bg2);}
+[data-theme="light"] .card{background:var(--bg2);}
+[data-theme="light"] .toast{background:var(--bg2);border-color:var(--border2);}
+[data-theme="light"] .btn-ghost{background:var(--bg3);border-color:var(--border2);}
+[data-theme="light"] .field input,
+[data-theme="light"] .field select,
+[data-theme="light"] .field textarea{background:var(--bg3);border-color:var(--border);}
+[data-theme="light"] .nb.active{background:rgba(99,85,232,.08);}
+[data-theme="light"] .acc-dropdown{background:var(--bg2);}
+[data-theme="light"] select,
+[data-theme="light"] input{color:var(--text);}
 html{font-size:14px;}
 body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;line-height:1.6;}
 button{font-family:var(--font);cursor:pointer;}
 input,select,textarea{font-family:var(--font);}
-::-webkit-scrollbar{width:5px;height:5px;}
-::-webkit-scrollbar-track{background:var(--bg2);}
-::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px;}
 
-/* LAYOUT */
+/* ── LAYOUT ─────────────────────────────────────────── */
 .shell{display:flex;height:100vh;overflow:hidden;}
-.sidebar{width:216px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;}
-.main{flex:1;overflow-y:auto;overflow-x:hidden;}
+.sidebar{width:220px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;}
+.main{flex:1;overflow-y:auto;overflow-x:hidden;background:var(--bg);}
 
-/* SIDEBAR */
-.logo{padding:20px 16px 16px;border-bottom:1px solid var(--border);}
-.logo-row{display:flex;align-items:center;gap:9px;}
-.logo-icon{width:30px;height:30px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+/* ── SIDEBAR ────────────────────────────────────────── */
+.logo{padding:22px 18px 18px;border-bottom:1px solid var(--border);}
+.logo-row{display:flex;align-items:center;gap:10px;}
+.logo-icon{width:32px;height:32px;background:var(--accent);border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 0 0 1px rgba(124,111,252,.3),0 4px 12px rgba(124,111,252,.25);}
 .logo-icon svg{width:15px;height:15px;fill:none;stroke:#fff;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;}
-.logo-name{font-size:15px;font-weight:700;letter-spacing:-.3px;}
+.logo-name{font-size:15px;font-weight:700;letter-spacing:-.4px;color:var(--text);}
 .logo-sub{font-size:10px;color:var(--text3);font-family:var(--mono);letter-spacing:.5px;margin-top:1px;}
-.nav{padding:10px 8px;flex:1;}
-.nav-section{margin-bottom:18px;}
-.nav-label{font-size:9px;font-weight:600;letter-spacing:1.5px;color:var(--text3);text-transform:uppercase;padding:0 8px;margin-bottom:4px;}
-.nb{display:flex;align-items:center;gap:9px;width:100%;padding:8px 10px;border-radius:8px;border:none;background:none;color:var(--text2);font-size:12.5px;font-weight:400;transition:all .15s;text-align:left;}
-.nb svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;}
-.nb:hover{background:var(--bg3);color:var(--text);}
-.nb.active{background:rgba(108,99,255,.12);color:var(--accent);font-weight:500;}
-.nb.active svg{stroke:var(--accent);}
+.nav{padding:12px 10px;flex:1;overflow-y:auto;}
+.nav-section{margin-bottom:6px;}
+.nav-label{font-size:9px;font-weight:600;letter-spacing:1.8px;color:var(--text3);text-transform:uppercase;padding:8px 10px 4px;display:block;}
+.nb{display:flex;align-items:center;gap:9px;width:100%;padding:8px 10px;border-radius:var(--r-sm);border:none;background:none;color:var(--text3);font-size:12.5px;font-weight:400;transition:all .15s;text-align:left;letter-spacing:.1px;}
+.nb svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;opacity:.7;}
+.nb:hover{background:var(--bg3);color:var(--text2);}
+.nb:hover svg{opacity:1;}
+.nb.active{background:rgba(124,111,252,.1);color:var(--accent);font-weight:500;}
+.nb.active svg{stroke:var(--accent);opacity:1;}
 .sidebar-footer{padding:12px;border-top:1px solid var(--border);}
-.acct{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:10px;}
+.acct{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px 12px;display:flex;align-items:center;gap:10px;}
 .acct-av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;flex-shrink:0;}
-.acct-name{font-size:12px;font-weight:500;}
+.acct-name{font-size:12px;font-weight:500;color:var(--text);}
 .acct-role{font-size:10px;color:var(--text3);}
 
-/* TOPBAR */
-.topbar{display:flex;align-items:center;justify-content:space-between;padding:14px 22px;border-bottom:1px solid var(--border);background:var(--bg2);position:sticky;top:0;z-index:10;}
-.page-title{font-size:16px;font-weight:600;letter-spacing:-.3px;}
+/* ── TOPBAR ─────────────────────────────────────────── */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 28px;border-bottom:1px solid var(--border);background:var(--bg2);position:sticky;top:0;z-index:10;}
+.page-title{font-size:17px;font-weight:600;letter-spacing:-.4px;color:var(--text);}
 .topbar-right{display:flex;align-items:center;gap:8px;}
 
-/* BUTTONS */
-.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 13px;border-radius:8px;font-size:12px;font-weight:500;border:none;cursor:pointer;transition:all .15s;white-space:nowrap;}
+/* ── BUTTONS ────────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:var(--r-sm);font-size:12.5px;font-weight:500;border:none;cursor:pointer;transition:all .15s;white-space:nowrap;letter-spacing:.1px;}
 .btn svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
-.btn-primary{background:var(--accent);color:#fff;}.btn-primary:hover{opacity:.88;}
-.btn-ghost{background:var(--bg3);color:var(--text2);border:1px solid var(--border);}.btn-ghost:hover{color:var(--text);background:var(--bg4);}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(124,111,252,.3);}
+.btn-primary:hover{background:#6b5ef0;box-shadow:0 4px 12px rgba(124,111,252,.4);}
+.btn-ghost{background:var(--bg3);color:var(--text2);border:1px solid var(--border2);}
+.btn-ghost:hover{color:var(--text);background:var(--bg4);border-color:var(--border2);}
+.btn-danger{background:rgba(240,79,80,.1);color:var(--red);border:1px solid rgba(240,79,80,.2);}
+.btn-danger:hover{background:rgba(240,79,80,.18);}
 
-/* CONTENT */
-.content{padding:20px 22px;}
-.tab{display:none;animation:fi .18s ease;}
+/* ── CONTENT & TABS ─────────────────────────────────── */
+.content{padding:28px;}
+.tab{display:none;animation:fi .2s ease;}
 .tab.active{display:block;}
-@keyframes fi{from{opacity:0;transform:translateY(3px);}to{opacity:1;transform:translateY(0);}}
+@keyframes fi{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:translateY(0);}}
 
-/* STATS GRID */
-.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:18px;}
-.sc{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;position:relative;overflow:hidden;}
-.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--sc-c,var(--accent));opacity:.7;}
-.sc-label{font-size:10px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);margin-bottom:7px;}
-.sc-val{font-size:22px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px;line-height:1;}
-.sc-sub{font-size:10px;color:var(--text3);margin-top:4px;font-family:var(--mono);}
+/* ── STAT CARDS (dashboard KPI) ─────────────────────── */
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px;}
+.sc{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px 22px;position:relative;overflow:hidden;transition:border-color .2s;}
+.sc:hover{border-color:var(--border2);}
+.sc-accent{position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--sc-c,var(--accent)),transparent);opacity:.8;}
+.sc-label{font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;}
+.sc-val{font-size:26px;font-weight:700;font-family:var(--mono);letter-spacing:-.8px;line-height:1;}
+.sc-sub{font-size:10px;color:var(--text3);margin-top:6px;font-family:var(--mono);}
 
-/* CARDS */
-.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);margin-bottom:14px;}
-.ch{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
-.ct{font-size:10px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:var(--text2);}
-.cb{padding:18px;}
-.g2{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:14px;}
-.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px;}
-.g2e{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;}
+/* ── CHART CARDS ─────────────────────────────────────── */
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);margin-bottom:16px;}
+.ch{padding:16px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
+.ct{font-size:11px;font-weight:600;letter-spacing:.4px;color:var(--text2);}
+.cb{padding:20px 22px;}
+.g2{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px;}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px;}
+.g2e{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;}
 
-/* TABLE */
+/* ── TABLE ──────────────────────────────────────────── */
 .tw{overflow-x:auto;}
-table{width:100%;border-collapse:collapse;font-size:12px;}
-th{text-align:left;padding:9px 11px;font-size:9.5px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none;}
+table{width:100%;border-collapse:collapse;font-size:12.5px;}
+th{text-align:left;padding:10px 14px;font-size:10px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none;}
 th:hover{color:var(--text2);}
-td{padding:10px 11px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:middle;white-space:nowrap;}
+td{padding:12px 14px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:middle;white-space:nowrap;}
 tr:last-child td{border-bottom:none;}
-tr:hover td{background:var(--bg3);}
+tr:hover td{background:rgba(255,255,255,.02);}
 .mono{font-family:var(--mono);}
 
-/* BADGES */
-.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:600;}
-.bwin{background:rgba(62,207,142,.1);color:var(--green);border:1px solid rgba(62,207,142,.2);}
-.bloss{background:rgba(255,77,79,.1);color:var(--red);border:1px solid rgba(255,77,79,.2);}
-.bbe{background:rgba(249,160,63,.1);color:var(--accent3);border:1px solid rgba(249,160,63,.2);}
-.blong{background:rgba(78,204,163,.08);color:var(--accent2);border:1px solid rgba(78,204,163,.2);}
-.bshort{background:rgba(255,77,79,.08);color:var(--red);border:1px solid rgba(255,77,79,.2);}
-.btype{background:var(--bg3);color:var(--text2);border:1px solid var(--border);}
+/* ── BADGES ─────────────────────────────────────────── */
+.badge{display:inline-flex;align-items:center;padding:3px 8px;border-radius:6px;font-size:10px;font-weight:600;letter-spacing:.2px;}
+.bwin{background:rgba(62,207,142,.1);color:var(--green);}
+.bloss{background:rgba(240,79,80,.1);color:var(--red);}
+.bbe{background:rgba(240,160,48,.1);color:var(--accent3);}
+.blong{background:rgba(78,203,163,.1);color:var(--accent2);}
+.bshort{background:rgba(240,79,80,.08);color:var(--red);}
+.btype{background:var(--bg3);color:var(--text3);}
 
-/* FORM */
-.fsec{margin-bottom:22px;}
-.fsec-title{font-size:9.5px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;display:flex;align-items:center;gap:8px;}
+/* ── FORM ───────────────────────────────────────────── */
+.fsec{margin-bottom:28px;}
+.fsec-title{font-size:10px;font-weight:600;letter-spacing:1.2px;text-transform:uppercase;color:var(--text3);margin-bottom:12px;display:flex;align-items:center;gap:10px;}
 .fsec-title::after{content:'';flex:1;height:1px;background:var(--border);}
-.fg{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:9px;}
-.fg2{display:grid;grid-template-columns:1fr 1fr;gap:9px;}
-.field label{display:block;font-size:9.5px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:4px;}
-.field input,.field select,.field textarea{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12.5px;outline:none;transition:border-color .15s;}
-.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent);}
+.fg{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;}
+.fg2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.field label{display:block;font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:5px;}
+.field input,.field select,.field textarea{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:9px 12px;color:var(--text);font-size:13px;outline:none;transition:border-color .15s;}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,111,252,.08);}
 .field input::placeholder{color:var(--text3);}
 .field select option{background:var(--bg2);}
-.field textarea{resize:vertical;min-height:68px;line-height:1.5;}
+.field textarea{resize:vertical;min-height:72px;line-height:1.6;}
 .field.ro input{background:var(--bg4);color:var(--accent);font-family:var(--mono);font-weight:500;}
-.rr-box{display:flex;align-items:center;gap:8px;background:rgba(108,99,255,.07);border:1px solid rgba(108,99,255,.18);border-radius:10px;padding:12px 16px;margin-bottom:20px;}
+.rr-box{display:flex;align-items:center;gap:8px;background:rgba(124,111,252,.06);border:1px solid rgba(124,111,252,.14);border-radius:var(--r-sm);padding:14px 18px;margin-bottom:24px;}
 .rr-box-label{font-size:11px;color:var(--text3);}
-.rr-val{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--accent);margin-left:auto;}
-.pnl-val{font-family:var(--mono);font-size:13px;margin-left:10px;}
+.rr-val{font-family:var(--mono);font-size:24px;font-weight:700;color:var(--accent);margin-left:auto;}
+.pnl-val{font-family:var(--mono);font-size:14px;margin-left:12px;}
 
 /* CHIPS */
 .chips{display:flex;flex-wrap:wrap;gap:5px;}
@@ -152,12 +377,289 @@ tr:hover td{background:var(--bg3);}
 .del-btn{background:none;border:none;cursor:pointer;color:var(--text3);padding:3px 7px;border-radius:5px;font-size:12px;transition:all .14s;}
 .del-btn:hover{background:rgba(255,77,79,.1);color:var(--red);}
 
-/* EMPTY */
-.empty{text-align:center;padding:44px 20px;color:var(--text3);font-size:12px;}
-canvas{display:block;}
+/* LOGIN SCREEN */
+/* unused .login-screen removed */
+.login-box{background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:36px 40px;width:360px;max-width:95vw;}
+.login-logo{display:flex;align-items:center;gap:10px;margin-bottom:28px;}
+.login-logo-icon{width:36px;height:36px;background:var(--accent);border-radius:10px;display:flex;align-items:center;justify-content:center;}
+.login-logo-icon svg{width:18px;height:18px;fill:none;stroke:#fff;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;}
+.login-title{font-size:18px;font-weight:700;letter-spacing:-.4px;}
+.login-sub{font-size:11px;color:var(--text3);font-family:var(--mono);}
+.login-field{margin-bottom:12px;}
+.login-field label{display:block;font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:5px;}
+.login-field input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-size:13px;outline:none;transition:border-color .15s;font-family:var(--font);}
+.login-field input:focus{border-color:var(--accent);}
+.login-err{font-size:11px;color:var(--red);margin-bottom:10px;min-height:16px;font-family:var(--mono);}
+.login-btns{display:flex;flex-direction:column;gap:8px;}
+.login-divider{text-align:center;font-size:11px;color:var(--text3);margin:6px 0;}
+
+/* MODAL */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(3px);z-index:500;display:none;align-items:center;justify-content:center;}
+.modal-overlay.open{display:flex;}
+.modal-box{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:24px;width:440px;max-width:95vw;max-height:85vh;overflow-y:auto;}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;}
+.modal-title{font-size:14px;font-weight:600;}
+.modal-close{background:none;border:none;cursor:pointer;color:var(--text3);font-size:18px;padding:2px 6px;border-radius:6px;}
+.modal-close:hover{color:var(--text);background:var(--bg3);}
+.acc-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);margin-bottom:8px;transition:border-color .15s;}
+.acc-item.active-acc{border-color:var(--accent);background:rgba(108,99,255,.06);}
+.acc-dot{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff;flex-shrink:0;}
+.acc-name-text{flex:1;font-size:13px;font-weight:500;}
+.acc-active-badge{font-size:9px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--accent);background:rgba(108,99,255,.1);border:1px solid rgba(108,99,255,.2);padding:2px 7px;border-radius:20px;}
+
+/* FIREBASE BANNER */
+.fb-banner{display:none;align-items:center;gap:10px;background:rgba(249,160,63,.08);border:1px solid rgba(249,160,63,.2);border-radius:8px;padding:10px 14px;margin:0 22px 16px;font-size:11.5px;color:var(--accent3);}
+.fb-banner svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;flex-shrink:0;}
+
+/* ── MODALY ─────────────────────────────────────────── */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);z-index:100;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .2s ease;pointer-events:none;}
+.modal-bg.open{opacity:1;pointer-events:all;}
+.modal-box{background:var(--bg2);border:1px solid var(--border2);border-radius:16px;width:640px;max-width:96vw;max-height:90vh;overflow-y:auto;transform:translateY(12px) scale(.98);transition:transform .22s ease,opacity .22s ease;opacity:0;}
+.modal-bg.open .modal-box{transform:translateY(0) scale(1);opacity:1;}
+.modal-hd{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border);}
+.modal-title{font-size:14px;font-weight:600;}
+.modal-close{background:none;border:none;cursor:pointer;color:var(--text3);font-size:18px;width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;transition:all .14s;}
+.modal-close:hover{background:var(--bg3);color:var(--text);}
+.modal-body{padding:22px;}
+.modal-footer{padding:14px 22px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;justify-content:flex-end;}
+
+/* Trade detail grid */
+.td-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px;}
+.td-cell{background:var(--bg3);border-radius:8px;padding:10px 12px;}
+.td-cell-label{font-size:9px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);margin-bottom:3px;}
+.td-cell-val{font-family:var(--mono);font-size:15px;font-weight:600;}
+.td-section{margin-bottom:14px;}
+.td-section-title{font-size:9.5px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);margin-bottom:7px;}
+.td-text{font-size:12.5px;color:var(--text2);line-height:1.6;background:var(--bg3);border-radius:8px;padding:10px 12px;}
+
+/* ── TOASTY ─────────────────────────────────────────── */
+#toast-wrap{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;}
+.toast{background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:10px 18px;font-size:12.5px;font-weight:500;color:var(--text);display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,.4);animation:toastIn .25s ease forwards;white-space:nowrap;}
+.toast.out{animation:toastOut .25s ease forwards;}
+.toast-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+@keyframes toastIn{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
+@keyframes toastOut{from{opacity:1;transform:translateY(0);}to{opacity:0;transform:translateY(8px);}}
+
+/* ── TAGY ───────────────────────────────────────────── */
+.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600;background:rgba(108,99,255,.1);color:var(--accent);border:1px solid rgba(108,99,255,.2);gap:4px;}
+.tag-a{background:rgba(62,207,142,.1);color:var(--green);border-color:rgba(62,207,142,.2);}
+.tag-fomo{background:rgba(255,77,79,.1);color:var(--red);border-color:rgba(255,77,79,.2);}
+.tag-input-wrap{display:flex;flex-wrap:wrap;gap:5px;align-items:center;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:6px 8px;cursor:text;}
+.tag-input-wrap:focus-within{border-color:var(--accent);}
+.tag-input-wrap input{border:none;background:none;outline:none;color:var(--text);font-size:12.5px;font-family:var(--font);min-width:80px;flex:1;}
+.tag-x{cursor:pointer;opacity:.6;font-size:11px;margin-left:1px;}
+.tag-x:hover{opacity:1;}
+
+/* ── ÚČTY ───────────────────────────────────────────── */
+.acc-switcher{padding:8px 10px;border-bottom:1px solid var(--border);}
+.acc-pill{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;cursor:pointer;transition:background .14s;user-select:none;}
+.acc-pill:hover{background:var(--bg3);}
+.acc-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.acc-pill-name{font-size:12px;font-weight:500;flex:1;}
+.acc-pill-chevron{font-size:10px;color:var(--text3);}
+.acc-dropdown{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:6px;position:absolute;left:10px;right:10px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.4);}
+.acc-dropdown-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:7px;cursor:pointer;font-size:12.5px;transition:background .14s;}
+.acc-dropdown-item:hover{background:var(--bg3);}
+.acc-dropdown-item.active{background:rgba(108,99,255,.1);color:var(--accent);}
+
+/* ── ADVANCED ANALYTICS ─────────────────────────────── */
+.analytics-table{width:100%;border-collapse:collapse;font-size:12px;}
+.analytics-table th{text-align:left;padding:7px 10px;font-size:9.5px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);border-bottom:1px solid var(--border);}
+.analytics-table td{padding:9px 10px;border-bottom:1px solid var(--border);color:var(--text);}
+.analytics-table tr:last-child td{border-bottom:none;}
+.analytics-table tr:hover td{background:var(--bg3);}
+.streak-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;}
+.streak-win{background:rgba(62,207,142,.1);color:var(--green);}
+.streak-loss{background:rgba(255,77,79,.1);color:var(--red);}
+
+/* ── HOVER NA ŘÁDCÍCH ───────────────────────────────── */
+#journal-tbody tr{cursor:pointer;transition:background .12s;}
+#journal-tbody tr:hover td{background:rgba(108,99,255,.06)!important;}
+#journal-tbody tr.selected td{background:rgba(108,99,255,.1)!important;border-color:rgba(108,99,255,.2);}
+
+/* ── ANIMACE ────────────────────────────────────────── */
+@keyframes slideIn{from{opacity:0;transform:translateX(-8px);}to{opacity:1;transform:translateX(0);}}
+.tab.active{animation:fi .18s ease,none;}
+
+/* ── TRADE CARDS (TradeZella style) ─────────────────── */
+.trade-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;cursor:pointer;transition:border-color .15s,background .15s;display:grid;grid-template-columns:auto 1fr auto auto auto auto auto;align-items:center;gap:12px;}
+.trade-card:hover{border-color:var(--border2);background:var(--bg3);}
+.trade-card.win  {border-left:3px solid var(--green);}
+.trade-card.loss {border-left:3px solid var(--red);}
+.trade-card.be   {border-left:3px solid var(--accent3);}
+.tc-dir{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;}
+.tc-dir.long{background:rgba(78,204,163,.12);color:var(--accent2);}
+.tc-dir.short{background:rgba(255,77,79,.12);color:var(--red);}
+.tc-asset{font-size:14px;font-weight:600;}
+.tc-meta{font-size:10px;color:var(--text3);margin-top:1px;font-family:var(--mono);}
+.tc-tags{display:flex;flex-wrap:wrap;gap:3px;}
+.tc-pnl{font-family:var(--mono);font-size:15px;font-weight:700;text-align:right;min-width:80px;}
+.tc-rr{font-family:var(--mono);font-size:11px;color:var(--text2);text-align:right;}
+.tc-setup{font-size:10px;font-weight:500;color:var(--text2);background:var(--bg3);border:1px solid var(--border);padding:2px 8px;border-radius:20px;white-space:nowrap;}
+
+/* ── PLAYBOOK CARDS ──────────────────────────────────── */
+.pb-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:18px;cursor:pointer;transition:border-color .15s;}
+.pb-card:hover{border-color:var(--accent);}
+.pb-card-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;}
+.pb-card-name{font-size:14px;font-weight:600;}
+.pb-card-type{font-size:9px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--accent);background:rgba(108,99,255,.1);padding:2px 8px;border-radius:20px;}
+.pb-card-desc{font-size:12px;color:var(--text2);line-height:1.6;margin-bottom:12px;}
+.pb-card-stats{display:flex;gap:14px;}
+.pb-stat{text-align:center;}
+.pb-stat-val{font-family:var(--mono);font-size:15px;font-weight:600;}
+.pb-stat-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;}
+
+/* ── NOTE CARDS ──────────────────────────────────────── */
+.note-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:16px;}
+.note-card-date{font-size:10px;color:var(--text3);font-family:var(--mono);margin-bottom:6px;}
+.note-card-title{font-size:13px;font-weight:600;margin-bottom:6px;}
+.note-card-body{font-size:12px;color:var(--text2);line-height:1.6;}
+.note-card-footer{margin-top:10px;display:flex;justify-content:space-between;align-items:center;}
+
+/* ── TAG CARDS ───────────────────────────────────────── */
+.tag-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px;display:flex;align-items:center;gap:12px;}
+.tag-card-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.tag-card-name{font-size:13px;font-weight:500;flex:1;}
+.tag-card-count{font-family:var(--mono);font-size:12px;color:var(--text3);}
+
+/* ── ACCOUNT PAGE CARDS ──────────────────────────────── */
+.acc-page-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px;}
+.acc-page-card.active-acc-card{border-color:var(--accent);background:rgba(108,99,255,.04);}
+.acc-page-header{display:flex;align-items:center;gap:12px;margin-bottom:16px;}
+.acc-page-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0;}
+.acc-page-name{font-size:15px;font-weight:600;flex:1;}
+.acc-page-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.acc-page-stat{background:var(--bg3);border-radius:8px;padding:10px 12px;}
+.acc-page-stat-label{font-size:9.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;}
+.acc-page-stat-val{font-family:var(--mono);font-size:16px;font-weight:600;}
+
 </style>
 </head>
 <body>
+
+<!-- Toast kontejner -->
+<div id="toast-wrap"></div>
+
+<!-- Modal: Detail trade -->
+<div class="modal-bg" id="modal-detail">
+  <div class="modal-box" style="width:680px;">
+    <div class="modal-hd">
+      <div class="modal-title" id="md-title">Detail obchodu</div>
+      <button class="modal-close" onclick="closeModal('modal-detail')">✕</button>
+    </div>
+    <div class="modal-body" id="md-body"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-detail')">Zavřít</button>
+      <button class="btn btn-ghost" id="md-edit-btn" onclick="openEditFromDetail()">
+        <svg viewBox="0 0 13 13"><path d="M9 2l2 2-7 7H2v-2L9 2z"/></svg>Upravit
+      </button>
+      <button class="btn btn-danger" id="md-del-btn">
+        <svg viewBox="0 0 13 13"><polyline points="2 3 11 3"/><path d="M5 3V2h3v1M4 3v8h5V3"/></svg>Smazat
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Edit trade -->
+<div class="modal-bg" id="modal-edit">
+  <div class="modal-box" style="width:720px;">
+    <div class="modal-hd">
+      <div class="modal-title">Upravit obchod</div>
+      <button class="modal-close" onclick="closeModal('modal-edit')">✕</button>
+    </div>
+    <div class="modal-body" id="edit-body"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-edit')">Zrušit</button>
+      <button class="btn btn-primary" onclick="saveEdit()">Uložit změny</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Import MT5/MT4 CSV -->
+<div class="modal-bg" id="modal-import" onclick="if(event.target===this)closeModal('modal-import')">
+  <div class="modal-box" style="width:540px;">
+    <div class="modal-hd">
+      <div class="modal-title">Import z MT5 / MT4</div>
+      <button class="modal-close" onclick="closeModal('modal-import')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:12px;color:var(--text2);margin-bottom:16px;line-height:1.7;">
+        <strong style="color:var(--text)">Jak exportovat z MT5:</strong><br>
+        Terminal → Historie → pravý klik → <em>Uložit jako podrobná zpráva</em> → HTML nebo CSV.<br>
+        <strong style="color:var(--text)">Jak exportovat z MT4:</strong><br>
+        Account History → pravý klik → <em>Uložit jako podrobná zpráva</em>.
+      </div>
+      <div id="import-dropzone"
+        style="border:2px dashed var(--border2);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:all .2s;"
+        onclick="document.getElementById('import-file-input').click()"
+        ondragover="event.preventDefault();this.style.borderColor='var(--accent)';this.style.background='rgba(108,99,255,.06)'"
+        ondragleave="this.style.borderColor='var(--border2)';this.style.background=''"
+        ondrop="handleImportDrop(event)">
+        <div style="font-size:28px;margin-bottom:8px;">📂</div>
+        <div style="font-size:13px;font-weight:500;color:var(--text);">Přetáhni soubor sem nebo klikni pro výběr</div>
+        <div style="font-size:11px;color:var(--text3);margin-top:4px;">Podporované formáty: .csv, .htm, .html</div>
+        <input type="file" id="import-file-input" accept=".csv,.htm,.html" style="display:none" onchange="handleImportFile(this.files[0])">
+      </div>
+      <div id="import-preview" style="margin-top:14px;display:none;">
+        <div style="font-size:11px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:8px;">Náhled importu</div>
+        <div id="import-preview-body" style="background:var(--bg3);border-radius:8px;padding:12px;font-size:12px;color:var(--text2);max-height:180px;overflow-y:auto;font-family:var(--mono);"></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:12px;">
+          <span id="import-count" style="font-size:12px;color:var(--text2);"></span>
+          <button class="btn btn-primary" onclick="confirmImport()">Importovat</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="modal-bg" id="modal-accounts">
+  <div class="modal-box" style="width:420px;">
+    <div class="modal-hd">
+      <div class="modal-title">Správa účtů</div>
+      <button class="modal-close" onclick="closeModal('modal-accounts')">✕</button>
+    </div>
+    <div class="modal-body" id="accounts-body"></div>
+  </div>
+</div>
+
+<div id="fb-banner" style="display:none;position:fixed;bottom:16px;right:16px;z-index:300;background:rgba(249,160,63,.1);border:1px solid rgba(249,160,63,.3);border-radius:10px;padding:10px 14px;font-size:11px;color:#f9a03f;max-width:320px;gap:8px;align-items:flex-start;">
+  <span style="font-size:14px;flex-shrink:0;">⚠️</span>
+  <span><strong>Firebase není napojen.</strong> Vyplň FIREBASE_CONFIG v &lt;head&gt; pro ostrý provoz. Teď běží lokální mock.</span>
+</div>
+
+<!-- ── LOGIN OVERLAY ── -->
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:var(--bg);z-index:200;align-items:center;justify-content:center;">
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:36px 40px;width:380px;max-width:94vw;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:28px;">
+      <div style="width:34px;height:34px;background:var(--accent);border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 11 5 6 9 9 13 3"/><circle cx="13" cy="3" r="1.5" fill="white" stroke="none"/></svg>
+      </div>
+      <div>
+        <div style="font-size:17px;font-weight:700;letter-spacing:-.3px;">TradeLog</div>
+        <div style="font-size:10px;color:var(--text3);font-family:var(--mono);">Trading Journal</div>
+      </div>
+    </div>
+    <div style="margin-bottom:10px;">
+      <div style="font-size:9.5px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:4px;">Email</div>
+      <input id="login-email-input" type="email" placeholder="tvuj@email.cz" autocomplete="email"
+        style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 11px;color:var(--text);font-size:13px;outline:none;font-family:var(--font);"
+        onkeydown="if(event.key==='Enter')document.getElementById('login-pass-input').focus()"
+        onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+    </div>
+    <div style="margin-bottom:6px;">
+      <div style="font-size:9.5px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:4px;">Heslo</div>
+      <input id="login-pass-input" type="password" placeholder="••••••••" autocomplete="current-password"
+        style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 11px;color:var(--text);font-size:13px;outline:none;font-family:var(--font);"
+        onkeydown="if(event.key==='Enter')loginSubmit()"
+        onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+    </div>
+    <div id="login-err-msg" style="font-size:11px;color:var(--red);min-height:18px;margin-bottom:10px;font-family:var(--mono);"></div>
+    <button onclick="loginSubmit()" style="width:100%;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:500;cursor:pointer;font-family:var(--font);">
+      Vstoupit →
+    </button>
+    <div id="login-hint" style="margin-top:12px;font-size:10px;color:var(--text3);text-align:center;"></div>
+  </div>
+</div>
+
 <div class="shell">
 
 <!-- SIDEBAR -->
@@ -174,41 +676,62 @@ canvas{display:block;}
     </div>
   </div>
   <nav class="nav">
+    <!-- Inline account switcher -->
+    <div id="sidebar-accounts" style="margin-bottom:12px;"></div>
+
     <div class="nav-section">
-      <div class="nav-label">Přehled</div>
-      <button class="nb active" onclick="nav('dashboard')">
+      <button class="nb active" onclick="nav('dashboard')" data-tab="dashboard">
         <svg viewBox="0 0 16 16"><rect x="1" y="1" width="6" height="6" rx="1.5"/><rect x="9" y="1" width="6" height="6" rx="1.5"/><rect x="1" y="9" width="6" height="6" rx="1.5"/><rect x="9" y="9" width="6" height="6" rx="1.5"/></svg>Dashboard
       </button>
-      <button class="nb" onclick="nav('stats')">
-        <svg viewBox="0 0 16 16"><line x1="1" y1="15" x2="1" y2="5"/><line x1="5" y1="15" x2="5" y2="8"/><line x1="9" y1="15" x2="9" y2="3"/><line x1="13" y1="15" x2="13" y2="6"/><line x1="0" y1="15" x2="16" y2="15"/></svg>Statistiky
+      <button class="nb" onclick="nav('trades')" data-tab="trades">
+        <svg viewBox="0 0 16 16"><polyline points="1 11 5 6 9 9 13 3"/><line x1="1" y1="15" x2="15" y2="15"/></svg>Trades
+      </button>
+      <button class="nb" onclick="nav('analytics')" data-tab="analytics">
+        <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><polyline points="8 5 8 8 10.5 10.5"/></svg>Analytics
+      </button>
+      <button class="nb" onclick="nav('backtest')" data-tab="backtest" style="position:relative;">
+        <svg viewBox="0 0 16 16"><polyline points="1 4 8 1 15 4 8 7 1 4"/><polyline points="1 8 8 11 15 8"/><polyline points="1 12 8 15 15 12"/></svg>Backtesting
+        <span style="position:absolute;right:8px;font-size:8px;font-weight:700;background:var(--accent);color:#fff;padding:1px 5px;border-radius:10px;letter-spacing:.3px;">NEW</span>
       </button>
     </div>
+
     <div class="nav-section">
-      <div class="nav-label">Obchody</div>
-      <button class="nb" onclick="nav('new')">
-        <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><line x1="8" y1="5" x2="8" y2="11"/><line x1="5" y1="8" x2="11" y2="8"/></svg>Nový obchod
+      <div class="nav-label">Nástroje</div>
+      <button class="nb" onclick="nav('playbook')" data-tab="playbook">
+        <svg viewBox="0 0 16 16"><rect x="2" y="1" width="12" height="14" rx="1.5"/><line x1="5" y1="5" x2="11" y2="5"/><line x1="5" y1="8" x2="11" y2="8"/><line x1="5" y1="11" x2="8" y2="11"/></svg>Playbook
       </button>
-      <button class="nb" onclick="nav('journal')">
-        <svg viewBox="0 0 16 16"><rect x="2" y="1" width="12" height="14" rx="1.5"/><line x1="5" y1="5" x2="11" y2="5"/><line x1="5" y1="8" x2="11" y2="8"/><line x1="5" y1="11" x2="9" y2="11"/></svg>Journal
+      <button class="nb" onclick="nav('mistakes')" data-tab="mistakes">
+        <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7"/><line x1="8" y1="5" x2="8" y2="9"/><circle cx="8" cy="11.5" r=".8" fill="currentColor"/></svg>Mistakes
+      </button>
+      <button class="nb" onclick="nav('tags')" data-tab="tags">
+        <svg viewBox="0 0 16 16"><path d="M1 1h7l7 7-7 7-7-7V1z"/><circle cx="4.5" cy="4.5" r="1" fill="currentColor"/></svg>Tags
+      </button>
+      <button class="nb" onclick="nav('notes')" data-tab="notes">
+        <svg viewBox="0 0 16 16"><path d="M2 2h12v10l-3 3H2V2z"/><line x1="5" y1="6" x2="11" y2="6"/><line x1="5" y1="9" x2="9" y2="9"/></svg>Notes
       </button>
     </div>
+
     <div class="nav-section">
-      <div class="nav-label">Systém</div>
-      <button class="nb" onclick="nav('rules')">
-        <svg viewBox="0 0 16 16"><path d="M8 1L2 4v4c0 4 6 7 6 7s6-3 6-7V4z"/><polyline points="5 8 7 10 11 6"/></svg>Pravidla
+      <div class="nav-label">Správa</div>
+      <button class="nb" onclick="nav('accounts')" data-tab="accounts">
+        <svg viewBox="0 0 16 16"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>Accounts
+      </button>
+      <button class="nb" onclick="nav('settings')" data-tab="settings">
+        <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/></svg>Settings
       </button>
       <button class="nb" onclick="openImport()">
-        <svg viewBox="0 0 16 16"><path d="M3 12h10M8 14V6M5 9l3-3 3 3"/></svg>Import MT5/MT4
-      </button>
-      <button class="nb" onclick="exportCSV()">
-        <svg viewBox="0 0 16 16"><path d="M3 12h10M8 2v8M5 7l3 3 3-3"/></svg>Export CSV
+        <svg viewBox="0 0 16 16"><path d="M3 12h10M8 14V6M5 9l3-3 3 3"/></svg>Import MT5
       </button>
     </div>
   </nav>
   <div class="sidebar-footer">
     <div class="acct">
-      <div class="acct-av">T</div>
-      <div><div class="acct-name">Trader</div><div class="acct-role">Pro účet</div></div>
+      <div class="acct-av" id="acct-avatar">T</div>
+      <div style="flex:1;min-width:0;">
+        <div class="acct-name" id="acct-name">Trader</div>
+        <div class="acct-role" id="acct-email">Lokální účet</div>
+      </div>
+      <button onclick="logoutApp()" title="Odhlásit se" style="background:none;border:none;cursor:pointer;color:var(--text3);padding:4px 6px;border-radius:6px;font-size:14px;line-height:1;" onmouseover="this.style.color='var(--red)'" onmouseout="this.style.color='var(--text3)'">⏻</button>
     </div>
   </div>
 </aside>
@@ -219,32 +742,74 @@ canvas{display:block;}
 <!-- DASHBOARD -->
 <div id="tab-dashboard" class="tab active">
   <div class="topbar">
-    <div class="page-title">Dashboard</div>
+    <div>
+      <div class="page-title">Dashboard</div>
+      <div id="dash-account-label" style="font-size:11px;color:var(--text3);margin-top:1px;"></div>
+    </div>
     <div class="topbar-right">
-      <select id="dash-period" onchange="renderDashboard()" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:var(--text);font-size:11.5px;outline:none;font-family:var(--font);">
-        <option value="all">Celé období</option><option value="30">Posledních 30 dní</option><option value="7">Posledních 7 dní</option>
+      <select id="dash-period" onchange="renderDashboard()" style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:7px 10px;color:var(--text2);font-size:12px;outline:none;font-family:var(--font);">
+        <option value="all">All Time</option>
+        <option value="30">Last 30 Days</option>
+        <option value="7">Last 7 Days</option>
       </select>
       <button class="btn btn-primary" onclick="nav('new')">
-        <svg viewBox="0 0 13 13"><line x1="6.5" y1="1" x2="6.5" y2="12"/><line x1="1" y1="6.5" x2="12" y2="6.5"/></svg>Přidat obchod
+        <svg viewBox="0 0 13 13"><line x1="6.5" y1="1" x2="6.5" y2="12"/><line x1="1" y1="6.5" x2="12" y2="6.5"/></svg>Add Trade
       </button>
     </div>
   </div>
   <div class="content">
-    <div class="sgrid" id="main-stats"></div>
+
+    <!-- Hero KPI row -->
+    <div id="main-stats"></div>
+
+    <!-- Equity + Donut -->
     <div class="g2">
-      <div class="card"><div class="ch"><span class="ct">Equity křivka</span><span id="eq-badge" style="font-family:var(--mono);font-size:12px;"></span></div><div class="cb"><canvas id="c-equity" height="130"></canvas></div></div>
-      <div class="card"><div class="ch"><span class="ct">Win / Loss / BE</span></div><div class="cb"><canvas id="c-wl" height="130"></canvas></div></div>
+      <div class="card">
+        <div class="ch">
+          <span class="ct">Equity Curve</span>
+          <span id="eq-badge" style="font-family:var(--mono);font-size:13px;font-weight:600;"></span>
+        </div>
+        <div class="cb" style="padding:20px 22px 16px;">
+          <canvas id="c-equity" height="120"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <div class="ch"><span class="ct">Win / Loss / BE</span></div>
+        <div class="cb" style="display:flex;flex-direction:column;align-items:center;justify-content:center;">
+          <canvas id="c-wl" height="140"></canvas>
+          <div id="wl-legend" style="display:flex;gap:16px;margin-top:12px;"></div>
+        </div>
+      </div>
     </div>
+
+    <!-- Charts row -->
     <div class="g3">
-      <div class="card"><div class="ch"><span class="ct">P&L podle aktiva</span></div><div class="cb"><canvas id="c-asset" height="140"></canvas></div></div>
-      <div class="card"><div class="ch"><span class="ct">P&L podle dne</span></div><div class="cb"><canvas id="c-weekday" height="140"></canvas></div></div>
-      <div class="card"><div class="ch"><span class="ct">Distribuce P&L</span></div><div class="cb"><canvas id="c-dist" height="140"></canvas></div></div>
+      <div class="card">
+        <div class="ch"><span class="ct">P&L by Asset</span></div>
+        <div class="cb"><canvas id="c-asset" height="130"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="ch"><span class="ct">P&L by Day</span></div>
+        <div class="cb"><canvas id="c-weekday" height="130"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="ch"><span class="ct">P&L Distribution</span></div>
+        <div class="cb"><canvas id="c-dist" height="130"></canvas></div>
+      </div>
     </div>
-    <div class="irow" id="insights"></div>
+
+    <!-- Insight pills -->
+    <div id="insights" style="margin-bottom:16px;"></div>
+
+    <!-- Recent trades -->
     <div class="card">
-      <div class="ch"><span class="ct">Posledních 5 obchodů</span><button class="btn btn-ghost" onclick="nav('journal')" style="font-size:11px;padding:5px 10px;">Vše →</button></div>
-      <div class="tw"><table><thead><tr><th>Datum</th><th>Aktivum</th><th>Směr</th><th>Setup</th><th>P&L</th><th>R:R</th><th>Výsledek</th><th>Mindset</th></tr></thead><tbody id="recent-tbody"></tbody></table></div>
+      <div class="ch">
+        <span class="ct">Recent Trades</span>
+        <button class="btn btn-ghost" onclick="nav('trades')" style="font-size:11px;padding:5px 10px;">View All →</button>
+      </div>
+      <div id="recent-cards" style="padding:0;"></div>
     </div>
+
   </div>
 </div>
 
@@ -312,6 +877,13 @@ canvas{display:block;}
         <div class="fg">
           <div class="field"><label>Setup název</label><input type="text" id="n-setup" placeholder="BOS, FVG, OB, Breakout, SMC..."></div>
           <div class="field"><label>Confluences</label><input type="text" id="n-conf" placeholder="EMA, HTF bias, S/R, objem..."></div>
+          <div class="field"><label>Účet</label><select id="n-account"><option value="">— vybrat účet —</option></select></div>
+        </div>
+        <div class="field" style="margin-top:8px;">
+          <label>Tagy (Enter pro přidání)</label>
+          <div class="tag-input-wrap" id="tag-input-wrap" onclick="document.getElementById('tag-text').focus()">
+            <input id="tag-text" type="text" placeholder="A+, FOMO, Revenge, News..." onkeydown="handleTagInput(event)">
+          </div>
         </div>
       </div>
 
@@ -366,7 +938,9 @@ canvas{display:block;}
       <select id="f-dir" onchange="renderJournal()"><option value="">Long + Short</option><option>Long</option><option>Short</option></select>
       <select id="f-setup-f" onchange="renderJournal()"><option value="">Všechny setupy</option></select>
       <select id="f-session-f" onchange="renderJournal()"><option value="">Všechny sessiony</option><option>London</option><option>New York</option><option>Asian</option><option>London–NY Overlap</option></select>
-      <input type="text" id="f-search" placeholder="Hledat aktivum..." oninput="renderJournal()" style="width:130px;">
+      <select id="f-tag-f" onchange="renderJournal()"><option value="">Všechny tagy</option></select>
+      <select id="f-account-f" onchange="renderJournal()"><option value="">Všechny účty</option></select>
+      <input type="text" id="f-search" placeholder="Hledat aktivum..." oninput="renderJournal()" style="width:120px;">
       <button class="btn btn-ghost" onclick="clearFilters()" style="font-size:11px;padding:5px 9px;">Reset</button>
     </div>
     <div class="card" style="margin:0;"><div class="tw">
@@ -375,7 +949,7 @@ canvas{display:block;}
           <th onclick="sb('date')">Datum ↕</th><th>Aktivum</th><th>Typ</th><th>Směr</th>
           <th onclick="sb('entry')">Entry ↕</th><th onclick="sb('exit')">Exit ↕</th>
           <th>SL</th><th>TP</th><th>Lot/Ks</th>
-          <th onclick="sb('pnl')">P&L ↕</th><th>R:R</th><th>Setup</th><th>Session</th><th>Výsledek</th><th>Mindset</th><th></th>
+          <th onclick="sb('pnl')">P&L ↕</th><th>R:R</th><th>Setup</th><th>Tagy</th><th>Session</th><th>Výsledek</th><th></th>
         </tr></thead>
         <tbody id="journal-tbody"></tbody>
       </table>
@@ -406,24 +980,809 @@ canvas{display:block;}
 </div>
 
 </div><!-- /.main -->
+
+<!-- ANALYTICS TAB -->
+<div id="tab-analytics" class="tab" style="display:none;">
+  <div class="topbar"><div class="page-title">Analytics</div></div>
+  <div class="content">
+    <div class="sgrid" id="analytics-kpi"></div>
+    <div class="g2e">
+      <div class="card"><div class="ch"><span class="ct">Win rate podle setupu</span></div><div class="cb"><div id="an-setup"></div></div></div>
+      <div class="card"><div class="ch"><span class="ct">Win rate podle sessiony</span></div><div class="cb"><div id="an-session"></div></div></div>
+    </div>
+    <div class="g2e">
+      <div class="card"><div class="ch"><span class="ct">Win rate podle aktiva</span></div><div class="cb"><div id="an-asset"></div></div></div>
+      <div class="card"><div class="ch"><span class="ct">Série výher / ztrát</span></div><div class="cb" id="an-streaks"></div></div>
+    </div>
+    <div class="card"><div class="ch"><span class="ct">Best &amp; Worst dny</span></div><div class="cb" id="an-days"></div></div>
+  </div>
+</div>
+
+<!-- BACKTEST TAB — samostatný workspace -->
+<div id="tab-backtest" class="tab" style="display:none;">
+  <div class="topbar">
+    <div>
+      <div class="page-title">Backtesting</div>
+      <div style="font-size:11px;color:var(--text3);margin-top:1px;">Oddělený workspace — nezávislý na live trades</div>
+    </div>
+    <div class="topbar-right">
+      <button class="btn btn-ghost" onclick="showBtView('sessions')" id="bt-tab-sessions" style="font-size:12px;">Sessions</button>
+      <button class="btn btn-ghost" onclick="showBtView('new')"      id="bt-tab-new"      style="font-size:12px;">+ New Trade</button>
+      <button class="btn btn-ghost" onclick="showBtView('analytics')" id="bt-tab-analytics" style="font-size:12px;">Analytics</button>
+    </div>
+  </div>
+  <div class="content">
+
+    <!-- Sessions view -->
+    <div id="bt-view-sessions">
+      <div id="bt-kpi" class="sgrid" style="margin-bottom:20px;"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <div style="font-size:12px;font-weight:600;color:var(--text2);">Sessions</div>
+        <button class="btn btn-primary" style="font-size:12px;" onclick="openNewSession()">+ New Session</button>
+      </div>
+      <div id="bt-sessions-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+      <div id="bt-sessions-empty" class="empty" style="display:none;"><p>Žádné backtest sessions. Vytvoř první session.</p></div>
+    </div>
+
+    <!-- New trade form -->
+    <div id="bt-view-new" style="display:none;">
+      <div class="card">
+        <div class="ch"><span class="ct">New Backtest Trade</span></div>
+        <div class="cb">
+          <div class="fsec"><div class="fsec-title">Session & základní info</div>
+            <div class="fg">
+              <div class="field"><label>Session</label>
+                <select id="bt-session-id"><option value="">— vybrat session —</option></select>
+              </div>
+              <div class="field"><label>Datum</label><input type="date" id="bt-date"></div>
+              <div class="field"><label>Symbol</label><input type="text" id="bt-asset" placeholder="EURUSD, BTC..."></div>
+              <div class="field"><label>Směr</label><select id="bt-dir"><option>Long</option><option>Short</option></select></div>
+              <div class="field"><label>Timeframe</label>
+                <select id="bt-tf"><option>M1</option><option>M5</option><option>M15</option><option>M30</option><option>H1</option><option selected>H4</option><option>D1</option></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="fsec"><div class="fsec-title">Ceny & R-multiple</div>
+            <div class="fg">
+              <div class="field"><label>Entry</label><input type="number" id="bt-entry" step="any" placeholder="0.00" oninput="calcBtRR()"></div>
+              <div class="field"><label>Stop Loss</label><input type="number" id="bt-sl" step="any" placeholder="0.00" oninput="calcBtRR()"></div>
+              <div class="field"><label>Take Profit</label><input type="number" id="bt-tp" step="any" placeholder="0.00" oninput="calcBtRR()"></div>
+              <div class="field"><label>Exit cena</label><input type="number" id="bt-exit" step="any" placeholder="0.00" oninput="calcBtRR()"></div>
+              <div class="field"><label>Výsledek</label><select id="bt-result"><option>Win</option><option>Loss</option><option>Breakeven</option></select></div>
+            </div>
+            <!-- R-multiple live display -->
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:12px;">
+              <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:12px;text-align:center;">
+                <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;">Planned R:R</div>
+                <div id="bt-planned-rr" style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--accent);">—</div>
+              </div>
+              <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:12px;text-align:center;">
+                <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;">Actual R</div>
+                <div id="bt-actual-r" style="font-family:var(--mono);font-size:20px;font-weight:700;">—</div>
+              </div>
+              <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:12px;text-align:center;">
+                <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;">MFE pips</div>
+                <div id="bt-mfe" style="font-family:var(--mono);font-size:20px;font-weight:700;color:var(--text2);">—</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="fsec"><div class="fsec-title">Strategy & Tagy</div>
+            <div class="fg">
+              <div class="field"><label>Setup / Model</label><input type="text" id="bt-setup" placeholder="SMC, ICT, BOS, FVG..."></div>
+              <div class="field"><label>Strategy tag</label>
+                <select id="bt-strategy"><option value="">— žádná —</option></select>
+              </div>
+              <div class="field"><label>Session</label>
+                <select id="bt-mkt-session"><option>London</option><option>New York</option><option>Asian</option><option>London–NY Overlap</option></select>
+              </div>
+            </div>
+          </div>
+
+          <div class="fsec"><div class="fsec-title">Mistakes & Notes</div>
+            <div style="margin-bottom:10px;">
+              <div style="font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:6px;">Mistakes</div>
+              <div id="bt-mistakes-chips" style="display:flex;flex-wrap:wrap;gap:5px;"></div>
+            </div>
+            <div class="fg2" style="margin-bottom:10px;">
+              <div class="field"><label>Co fungovalo</label><textarea id="bt-good" placeholder="Správný vstup, dodržel SL..."></textarea></div>
+              <div class="field"><label>Chyby</label><textarea id="bt-bad" placeholder="Brzy vstoupil, ignoroval HTF..."></textarea></div>
+            </div>
+            <div class="field"><label>Screenshot URL / popis</label><input type="text" id="bt-screenshot" placeholder="https://... nebo popis chartu"></div>
+            <div class="field" style="margin-top:8px;"><label>Poznámky</label><textarea id="bt-notes" placeholder="Kontext, co příště udělat jinak..."></textarea></div>
+          </div>
+
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-primary" onclick="saveBtTrade()">Uložit trade</button>
+            <button class="btn btn-ghost" onclick="clearBtForm()">Vymazat</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Analytics view -->
+    <div id="bt-view-analytics" style="display:none;">
+      <div id="bt-analytics-kpi" class="sgrid" style="margin-bottom:20px;"></div>
+      <div class="g2e">
+        <div class="card"><div class="ch"><span class="ct">Equity Curve (backtest)</span></div><div class="cb"><canvas id="bt-equity-chart" height="140"></canvas></div></div>
+        <div class="card"><div class="ch"><span class="ct">R-Multiple distribuce</span></div><div class="cb"><canvas id="bt-r-chart" height="140"></canvas></div></div>
+      </div>
+      <div class="g2e">
+        <div class="card"><div class="ch"><span class="ct">Win Rate podle setupu</span></div><div class="cb"><div id="bt-an-setup"></div></div></div>
+        <div class="card"><div class="ch"><span class="ct">Win Rate podle sessiony</span></div><div class="cb"><div id="bt-an-session"></div></div></div>
+      </div>
+      <div class="card">
+        <div class="ch"><span class="ct">Session Review — všechny trades</span></div>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:12px;">
+            <thead><tr>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Datum</th>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Symbol</th>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Setup</th>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Plán. R:R</th>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Skuteč. R</th>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Výsledek</th>
+              <th style="padding:9px 14px;border-bottom:1px solid var(--border);text-align:left;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Mistakes</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="bt-trades-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- TRADES TAB (nový hlavní seznam s filtrováním) -->
+<div id="tab-trades" class="tab" style="display:none;">
+  <div class="topbar">
+    <div class="page-title">Trades</div>
+    <div class="topbar-right">
+      <button class="btn btn-ghost" onclick="exportCSV()">Export CSV</button>
+      <button class="btn btn-primary" onclick="nav('new')">
+        <svg viewBox="0 0 13 13"><line x1="6.5" y1="1" x2="6.5" y2="12"/><line x1="1" y1="6.5" x2="12" y2="6.5"/></svg>Add Trade
+      </button>
+    </div>
+  </div>
+  <div class="content">
+    <!-- Summary stripe -->
+    <div id="trades-summary" class="sgrid" style="margin-bottom:14px;"></div>
+    <!-- Filters -->
+    <div class="fbar" style="margin-bottom:12px;">
+      <select id="tf-result" onchange="renderTrades()"><option value="">All Results</option><option>Win</option><option>Loss</option><option>Breakeven</option></select>
+      <select id="tf-dir"    onchange="renderTrades()"><option value="">Long + Short</option><option>Long</option><option>Short</option></select>
+      <select id="tf-type"   onchange="renderTrades()"><option value="">All Types</option><option>Forex</option><option>Krypto</option><option>Akcie</option><option>ETF</option><option>Futures</option><option>Komodity</option></select>
+      <select id="tf-setup"  onchange="renderTrades()"><option value="">All Setups</option></select>
+      <select id="tf-session" onchange="renderTrades()"><option value="">All Sessions</option><option>London</option><option>New York</option><option>Asian</option><option>London–NY Overlap</option></select>
+      <select id="tf-tag"    onchange="renderTrades()"><option value="">All Tags</option></select>
+      <select id="tf-account" onchange="renderTrades()"><option value="">All Accounts</option></select>
+      <input  id="tf-search" type="text" placeholder="Search symbol..." oninput="renderTrades()" style="width:130px;">
+      <button class="btn btn-ghost" onclick="clearTradesFilters()" style="font-size:11px;padding:5px 9px;">Reset</button>
+    </div>
+    <!-- Trade cards grid -->
+    <div id="trades-grid" style="display:flex;flex-direction:column;gap:6px;"></div>
+    <div id="trades-empty" class="empty" style="display:none;">Žádné obchody.</div>
+  </div>
+</div>
+
+<!-- PLAYBOOK TAB -->
+<div id="tab-playbook" class="tab" style="display:none;">
+  <div class="topbar">
+    <div class="page-title">Playbook</div>
+    <div class="topbar-right">
+      <button class="btn btn-primary" onclick="openAddSetup()">+ Add Setup</button>
+    </div>
+  </div>
+  <div class="content">
+    <div id="playbook-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;"></div>
+    <div id="playbook-empty" class="empty" style="display:none;">
+      <p>Zatím žádné setupy. Přidej svůj první trading setup.</p>
+    </div>
+  </div>
+</div>
+
+<!-- MISTAKES TAB -->
+<div id="tab-mistakes" class="tab" style="display:none;">
+  <div class="topbar"><div class="page-title">Mistakes</div></div>
+  <div class="content">
+    <div class="sgrid" id="mistakes-kpi"></div>
+    <div class="g2e">
+      <div class="card">
+        <div class="ch"><span class="ct">Nejčastější chyby</span></div>
+        <div class="cb" id="mistakes-chart-wrap"><canvas id="mistakes-chart" height="200"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="ch"><span class="ct">Chyby podle výsledku</span></div>
+        <div class="cb" id="mistakes-by-result"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><span class="ct">Trades s chybami</span></div>
+      <div class="cb" style="padding:0;">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;">
+          <thead><tr>
+            <th style="padding:9px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:9.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Datum</th>
+            <th style="padding:9px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:9.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Aktivum</th>
+            <th style="padding:9px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:9.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">Chyby</th>
+            <th style="padding:9px 12px;border-bottom:1px solid var(--border);text-align:left;font-size:9.5px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;">P&L</th>
+          </tr></thead>
+          <tbody id="mistakes-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TAGS TAB -->
+<div id="tab-tags" class="tab" style="display:none;">
+  <div class="topbar">
+    <div class="page-title">Tags</div>
+    <div class="topbar-right">
+      <button class="btn btn-primary" onclick="openAddTag()">+ Add Tag</button>
+    </div>
+  </div>
+  <div class="content">
+    <div id="tags-overview" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:16px;"></div>
+    <div class="card">
+      <div class="ch"><span class="ct">Performance podle tagu</span></div>
+      <div class="cb" id="tags-table-wrap"></div>
+    </div>
+  </div>
+</div>
+
+<!-- NOTES TAB -->
+<div id="tab-notes" class="tab" style="display:none;">
+  <div class="topbar">
+    <div class="page-title">Notes</div>
+    <div class="topbar-right">
+      <button class="btn btn-primary" onclick="openAddNote()">+ Add Note</button>
+    </div>
+  </div>
+  <div class="content">
+    <div id="notes-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;"></div>
+    <div id="notes-empty" class="empty" style="display:none;"><p>Zatím žádné poznámky.</p></div>
+  </div>
+</div>
+
+<!-- ACCOUNTS TAB (přesunuto z modalu) -->
+<div id="tab-accounts" class="tab" style="display:none;">
+  <div class="topbar">
+    <div class="page-title">Accounts</div>
+    <div class="topbar-right">
+      <button class="btn btn-primary" onclick="openAddAccountInline()">+ Add Account</button>
+    </div>
+  </div>
+  <div class="content">
+    <div id="accounts-page-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;"></div>
+  </div>
+</div>
+
+<!-- SETTINGS TAB -->
+<div id="tab-settings" class="tab" style="display:none;">
+  <div class="topbar"><div class="page-title">Settings</div></div>
+  <div class="content">
+
+    <!-- Theme toggle — první karta -->
+    <div class="card" style="margin-bottom:16px;">
+      <div class="ch"><span class="ct">Appearance</span></div>
+      <div class="cb">
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <div>
+            <div style="font-size:13px;font-weight:500;margin-bottom:3px;">Theme</div>
+            <div style="font-size:11px;color:var(--text3);">Přepínání mezi dark a light mode</div>
+          </div>
+          <div id="theme-toggle-wrap" style="display:flex;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:3px;gap:3px;">
+            <button id="btn-dark"  onclick="setTheme('dark')"  style="padding:6px 14px;border-radius:8px;border:none;font-size:12px;font-weight:500;cursor:pointer;font-family:var(--font);transition:all .15s;">🌙 Dark</button>
+            <button id="btn-light" onclick="setTheme('light')" style="padding:6px 14px;border-radius:8px;border:none;font-size:12px;font-weight:500;cursor:pointer;font-family:var(--font);transition:all .15s;">☀️ Light</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="g2e">
+      <div class="card">
+        <div class="ch"><span class="ct">Pravidla & Systém</span></div>
+        <div class="cb">
+          <div id="settings-rules-list"></div>
+          <div style="display:flex;gap:8px;margin-top:14px;">
+            <input type="text" id="settings-rule-input" placeholder="Nové pravidlo..."
+              style="flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12.5px;outline:none;font-family:var(--font);"
+              onkeydown="if(event.key==='Enter')addRule()">
+            <button class="btn btn-primary" onclick="addRule()">Přidat</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="ch"><span class="ct">Data & Export</span></div>
+        <div class="cb" style="display:flex;flex-direction:column;gap:10px;">
+          <button class="btn btn-ghost" onclick="exportCSV()" style="justify-content:flex-start;gap:8px;">
+            <svg viewBox="0 0 13 13" width="13" height="13"><path d="M3 10h7M6.5 2v6M4 6l2.5 2.5L9 6"/></svg>
+            Export CSV
+          </button>
+          <button class="btn btn-ghost" onclick="openImport()" style="justify-content:flex-start;gap:8px;">
+            <svg viewBox="0 0 13 13" width="13" height="13"><path d="M3 10h7M6.5 8V2M4 4l2.5-2.5L9 4"/></svg>
+            Import MT5/MT4
+          </button>
+          <button class="btn btn-danger" onclick="confirmClearData()" style="justify-content:flex-start;gap:8px;margin-top:8px;">
+            Smazat všechna data
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ch"><span class="ct">Mistakes katalog</span></div>
+      <div class="cb" id="settings-mistakes-catalog">
+        <div id="mistakes-list" style="margin-bottom:14px;"></div>
+        <div style="display:flex;gap:8px;">
+          <input type="text" id="mistake-input" placeholder="Nový typ chyby (FOMO, Early Entry, SL Move...)"
+            style="flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12.5px;outline:none;font-family:var(--font);"
+            onkeydown="if(event.key==='Enter')addMistakeType()">
+          <button class="btn btn-primary" onclick="addMistakeType()">Přidat</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 </div><!-- /.shell -->
 
 <script>
 // ─── DATA ───────────────────────────────────────────
 let trades=[], rules=[], selMoods=[], selRules=[], _ch={}, sortCol='date', sortDir=-1;
+let _tags=[], _editIdx=null; // tagy pro aktuální formulář, index editovaného trade
 
-function load(){
+// Účty — lokálně
+let accounts=[], activeAccount='';
+async function loadAccounts(){
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbLoadAccounts){
+    try{
+      accounts = await window._fbLoadAccounts(uid);
+    } catch(e){
+      console.warn('Firestore loadAccounts failed:', e);
+      accounts = [];
+    }
+  } else {
+    // localStorage fallback
+    try{accounts=JSON.parse(localStorage.getItem('tl3_accounts')||'[]');}catch(e){accounts=[];}
+  }
+
+  if(!accounts.length){
+    const def = {id:'default', name:'Hlavní účet', color:'#6c63ff'};
+    accounts = [def];
+    await saveAccounts(); // Ulož defaultní účet
+  }
+
+  activeAccount = localStorage.getItem('tl3_active_acc') || accounts[0].id;
+  if(!accounts.find(a=>a.id===activeAccount)) activeAccount = accounts[0].id;
+}
+
+async function saveAccounts(){
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbSaveAccount){
+    try{
+      await Promise.all(accounts.map(a => window._fbSaveAccount(uid, a)));
+      return;
+    } catch(e){ console.warn('Firestore saveAccounts failed:', e); }
+  }
+  localStorage.setItem('tl3_accounts', JSON.stringify(accounts));
+}
+
+function renderSidebarAccounts(){
+  const el=document.getElementById('sidebar-accounts');
+  if(!el)return;
+  el.innerHTML=`
+    <div style="padding:0 2px;">
+      <div style="font-size:9px;font-weight:600;letter-spacing:1.5px;color:var(--text3);text-transform:uppercase;padding:0 8px;margin-bottom:5px;">Účet</div>
+      ${accounts.map(a=>{
+        const cnt=trades.filter(t=>t.account===a.id).length;
+        const isActive=a.id===activeAccount;
+        return `<div onclick="setActiveAccount('${a.id}');renderSidebarAccounts();"
+          style="display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;cursor:pointer;
+                 background:${isActive?'rgba(108,99,255,.1)':'none'};
+                 border:1px solid ${isActive?'rgba(108,99,255,.2)':'transparent'};
+                 margin-bottom:3px;transition:all .14s;"
+          onmouseover="if('${a.id}'!=='${activeAccount}')this.style.background='var(--bg3)'"
+          onmouseout="if('${a.id}'!=='${activeAccount}')this.style.background='none'">
+          <div style="width:8px;height:8px;border-radius:50%;background:${a.color};flex-shrink:0;"></div>
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:12px;font-weight:${isActive?'600':'400'};color:${isActive?'var(--accent)':'var(--text2)'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${a.name}</div>
+          </div>
+          <div style="font-size:10px;font-family:var(--mono);color:var(--text3);">${cnt}</div>
+        </div>`;
+      }).join('')}
+      <button onclick="openModal('modal-accounts');renderAccountsModal();"
+        style="width:100%;margin-top:4px;background:none;border:1px dashed var(--border);border-radius:8px;
+               padding:5px;font-size:11px;color:var(--text3);cursor:pointer;transition:all .14s;"
+        onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'"
+        onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">
+        + Spravovat účty
+      </button>
+    </div>
+  `;
+}
+
+function updateSidebarAccount(){
+  // Aktualizuje jen aktivní stav bez překreslení celého sidebaru
+  renderSidebarAccounts();
+}
+function saveAccounts(){localStorage.setItem('tl3_accounts',JSON.stringify(accounts));}
+function setActiveAccount(id){
+  activeAccount=id;
+  localStorage.setItem('tl3_active_acc',id);
+  // Refresh všeho po přepnutí účtu
+  updateSidebarAccount();
+  renderDashboard();
+  buildAccountFilter();
+  buildAccountSelect();
+}
+
+// Helper — vrátí trades jen pro aktivní účet
+function accountTrades(){
+  return trades.filter(t=> !t.account || t.account===activeAccount);
+}
+
+// ─── MODAL SYSTÉM ────────────────────────────────────
+function openModal(id){
+  const el=document.getElementById(id);
+  el.classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeModal(id){
+  const el=document.getElementById(id);
+  el.classList.remove('open');
+  document.body.style.overflow='';
+}
+// Zavři modal kliknutím na pozadí
+document.addEventListener('click',e=>{
+  if(e.target.classList.contains('modal-bg')) closeModal(e.target.id);
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape') document.querySelectorAll('.modal-bg.open').forEach(m=>closeModal(m.id));
+});
+
+// ─── TOAST ───────────────────────────────────────────
+function toast(msg, type='success'){
+  const colors={success:'var(--green)',error:'var(--red)',info:'var(--accent)',warn:'var(--accent3)'};
+  const wrap=document.getElementById('toast-wrap');
+  const el=document.createElement('div');
+  el.className='toast';
+  el.innerHTML=`<span class="toast-dot" style="background:${colors[type]||colors.success}"></span>${msg}`;
+  wrap.appendChild(el);
+  setTimeout(()=>{el.classList.add('out');setTimeout(()=>el.remove(),260);},2400);
+}
+
+// ─── TAGY ────────────────────────────────────────────
+function handleTagInput(e){
+  if(e.key==='Enter'||e.key===','){
+    e.preventDefault();
+    const val=e.target.value.trim().replace(/,$/,'');
+    if(val&&!_tags.includes(val)){
+      _tags.push(val);
+      renderTagsInWrap('tag-input-wrap','tag-text');
+    } else { e.target.value=''; }
+  }
+  if(e.key==='Backspace'&&!e.target.value&&_tags.length){
+    _tags.pop();
+    renderTagsInWrap('tag-input-wrap','tag-text');
+  }
+}
+function renderTagsInWrap(wrapId, inputId){
+  const wrap=document.getElementById(wrapId);
+  const inp=document.getElementById(inputId);
+  const existingTags=wrap.querySelectorAll('.tag');
+  existingTags.forEach(t=>t.remove());
+  inp.value='';
+  _tags.forEach((t,i)=>{
+    const span=document.createElement('span');
+    span.className='tag';
+    span.innerHTML=`${t}<span class="tag-x" onclick="_tags.splice(${i},1);renderTagsInWrap('${wrapId}','${inputId}')">×</span>`;
+    wrap.insertBefore(span,inp);
+  });
+}
+function buildTagFilter(){
+  const allTags=[...new Set(trades.flatMap(t=>t.tags||[]))].sort();
+  const sel=document.getElementById('f-tag-f');
+  if(!sel)return;
+  const cur=sel.value;
+  sel.innerHTML='<option value="">Všechny tagy</option>'+allTags.map(t=>`<option>${t}</option>`).join('');
+  if(cur)sel.value=cur;
+}
+
+// ─── ÚČTY ────────────────────────────────────────────
+function buildAccountFilter(){
+  const sel=document.getElementById('f-account-f');
+  if(!sel)return;
+  sel.innerHTML='<option value="">Všechny účty</option>'+accounts.map(a=>`<option value="${a.id}">${a.name}</option>`).join('');
+}
+function buildAccountSelect(){
+  const sel=document.getElementById('n-account');
+  if(!sel)return;
+  sel.innerHTML='<option value="">— vybrat účet —</option>'+accounts.map(a=>`<option value="${a.id}"${a.id===activeAccount?' selected':''}>${a.name}</option>`).join('');
+}
+function renderAccountsModal(){
+  const body=document.getElementById('accounts-body');
+  body.innerHTML=`
+    <div style="margin-bottom:14px;">
+      ${accounts.map((a,i)=>{
+        const cnt=trades.filter(t=>t.account===a.id).length;
+        const isActive=a.id===activeAccount;
+        return `<div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
+          <div style="width:10px;height:10px;border-radius:50%;background:${a.color};flex-shrink:0;"></div>
+          <div style="flex:1;">
+            <div style="font-size:13px;font-weight:500;">${a.name}</div>
+            <div style="font-size:10px;color:var(--text3);font-family:var(--mono);">${cnt} obchodů</div>
+          </div>
+          ${isActive
+            ?'<span style="font-size:9px;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:.5px;background:rgba(108,99,255,.1);padding:2px 8px;border-radius:20px;">Aktivní</span>'
+            :`<button class="btn btn-ghost" style="font-size:11px;padding:4px 9px;" onclick="setActiveAccount('${a.id}');renderAccountsModal();">Přepnout</button>`
+          }
+          <button class="btn btn-ghost" style="font-size:11px;padding:4px 9px;" onclick="renameAccount(${i})">✏️</button>
+          ${accounts.length>1?`<button class="del-btn" onclick="deleteAccount(${i})">✕</button>`:''}
+        </div>`;
+      }).join('')}
+    </div>
+    <div style="border-top:1px solid var(--border);padding-top:14px;">
+      <div style="font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--text3);margin-bottom:8px;">Přidat účet</div>
+      <div style="display:flex;gap:8px;">
+        <input id="new-acc-input" type="text" placeholder="Název účtu (FTMO, Prop firma...)"
+          style="flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12.5px;outline:none;font-family:var(--font);"
+          onkeydown="if(event.key==='Enter')addAccount()">
+        <button class="btn btn-primary" onclick="addAccount()">Přidat</button>
+      </div>
+    </div>
+  `;
+}
+async function addAccount(){
+  const name=document.getElementById('new-acc-input')?.value.trim();
+  if(!name)return;
+  const colors=['#6c63ff','#4ecca3','#f9a03f','#ff4d4f','#3ecf8e','#e879f9','#38bdf8'];
+  const newAcc={id:'acc_'+Date.now(),name,color:colors[accounts.length%colors.length]};
+  accounts.push(newAcc);
+  await saveAccounts();
+  renderAccountsModal();
+  buildAccountFilter();
+  buildAccountSelect();
+  renderSidebarAccounts();
+  toast('Účet přidán');
+}
+async function deleteAccount(i){
+  if(accounts.length<=1){toast('Nelze smazat poslední účet','error');return;}
+  if(!confirm('Smazat účet? Trades zůstanou uloženy.'))return;
+  const delId = accounts[i].id;
+  if(delId===activeAccount) setActiveAccount(accounts[i===0?1:0].id);
+  accounts.splice(i,1);
+  // Firebase: smaž účet + jeho trades
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbDeleteAccount){
+    try{ await window._fbDeleteAccount(uid, delId); }
+    catch(e){ console.warn('Firestore deleteAccount failed:', e); }
+  }
+  await saveAccounts();
+  renderAccountsModal();
+  buildAccountFilter();
+  renderSidebarAccounts();
+  toast('Účet smazán');
+}
+async function renameAccount(i){
+  const name=prompt('Nový název účtu:', accounts[i].name);
+  if(!name||!name.trim())return;
+  accounts[i].name=name.trim();
+  await saveAccounts();
+  renderAccountsModal();
+  buildAccountFilter();
+  buildAccountSelect();
+  updateSidebarAccount();
+  renderSidebarAccounts();
+  toast('Účet přejmenován');
+}
+
+// ─── LOAD / SAVE — Firebase + localStorage fallback ──
+async function load(){
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbLoadTrades){
+    try{
+      const [fbTrades, fbRules] = await Promise.all([
+        window._fbLoadTrades(uid),
+        window._fbLoadRules(uid),
+      ]);
+      trades = fbTrades;
+      rules  = fbRules;
+      return;
+    } catch(e){ console.warn('Firestore load failed, falling back to localStorage:', e); }
+  }
+  // localStorage fallback
   try{trades=JSON.parse(localStorage.getItem('tl3_trades')||'[]');}catch(e){trades=[];}
   try{rules=JSON.parse(localStorage.getItem('tl3_rules')||'[]');}catch(e){rules=[];}
 }
-function save(){
+
+async function save(){
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbSaveAllTrades){
+    try{
+      await Promise.all([
+        window._fbSaveAllTrades(uid, trades),
+        window._fbSaveRules(uid, rules),
+      ]);
+      return;
+    } catch(e){ console.warn('Firestore save failed, falling back to localStorage:', e); }
+  }
+  // localStorage fallback
   try{localStorage.setItem('tl3_trades',JSON.stringify(trades));localStorage.setItem('tl3_rules',JSON.stringify(rules));}catch(e){}
 }
 
-load();
+// Rychlá verze pro single-trade operace (přidat/upravit/smazat)
+async function saveTradeFb(trade){
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbSaveTrade){
+    try{ trade._fid = await window._fbSaveTrade(uid, trade); return; }
+    catch(e){ console.warn('Firestore saveTrade failed:', e); }
+  }
+  await save();
+}
+async function deleteTradeFb(trade){
+  const uid = window._fbCurrentUid;
+  if(uid && window._fbDeleteTrade){
+    try{ await window._fbDeleteTrade(uid, trade); return; }
+    catch(e){ console.warn('Firestore deleteTrade failed:', e); }
+  }
+  await save();
+}
 
-// Demo data
-if(!trades.length){
+// ─── INIT ────────────────────────────────────────────
+async function initApp(){
+  initTheme();
+  loadExtras();
+  loadBtData();
+  try{
+    await loadAccounts();
+    await load();
+    if(!trades.length) loadDemoData();
+    if(!rules.length) loadDefaultRules();
+  } catch(e){
+    console.error('initApp load error:', e);
+  }
+  _setLoading(false);
+  setDef();
+  buildAccountSelect();
+  buildAccountFilter();
+  renderSidebarAccounts();
+  renderDashboard();
+}
+
+function _setLoading(on){
+  let el = document.getElementById('app-loading');
+  if(on){
+    if(!el){
+      el = document.createElement('div');
+      el.id = 'app-loading';
+      el.style.cssText = 'position:fixed;inset:0;background:var(--bg);z-index:150;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;';
+      el.innerHTML = `
+        <div style="width:36px;height:36px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;"></div>
+        <div style="font-size:12px;color:var(--text3);">Načítám data...</div>
+        <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
+      document.body.appendChild(el);
+    }
+    el.style.display = 'flex';
+  } else {
+    if(el) el.style.display = 'none';
+  }
+}
+
+function loadDefaultRules(){
+  rules=['Nikdy neposouvat SL do ztráty','Čekat na potvrzení (close svíčky)','Max 3 obchody za den','Neobchodovat po sérii 2 ztrát','Nepřidávat pozici v ztrátě','Neobchodovat před NFP/news','Dodržet R:R min 1:2','Max risk 1% na obchod','Neobchodovat první 15 min seance'];
+}
+
+// ─── AUTH — Firebase (krok 3) ────────────────────────
+// Callbacky volané z Firebase module scriptu v <head>
+window._fbOnLogin = function(user){
+  document.getElementById('login-overlay').style.display = 'none';
+  _updateSidebar(user.email);
+  initApp();
+};
+
+window._fbOnLogout = function(){
+  document.getElementById('login-overlay').style.display = 'flex';
+  document.getElementById('login-email-input').value = '';
+  document.getElementById('login-pass-input').value = '';
+  document.getElementById('login-err-msg').textContent = '';
+  document.getElementById('login-hint').textContent = 'Přihlas se pro vstup do journalu.';
+  setTimeout(()=>document.getElementById('login-email-input').focus(), 50);
+};
+
+// Lokální fallback (když Firebase config není vyplněn)
+window._localAuthFallback = function(){
+  initTheme();
+  const savedEmail = localStorage.getItem('tl3_session');
+  if(savedEmail){
+    window._fbOnLogin({email: savedEmail});
+  } else {
+    document.getElementById('login-overlay').style.display = 'flex';
+    document.getElementById('login-hint').textContent =
+      localStorage.getItem('tl3_users')
+        ? 'Přihlas se pro vstup do journalu.'
+        : '🆕 První spuštění — zadej email a heslo pro vytvoření účtu.';
+  }
+};
+
+function _updateSidebar(email){
+  const name = email.split('@')[0];
+  document.getElementById('acct-avatar').textContent = name.charAt(0).toUpperCase();
+  document.getElementById('acct-name').textContent   = name;
+  document.getElementById('acct-email').textContent  = email;
+}
+
+async function loginSubmit(){
+  const email = document.getElementById('login-email-input').value.trim().toLowerCase();
+  const pass  = document.getElementById('login-pass-input').value;
+  const err   = document.getElementById('login-err-msg');
+  const btn   = document.querySelector('#login-overlay button');
+  err.textContent = '';
+
+  if(!email || !email.includes('@')){ err.textContent = 'Zadej platný email.'; return; }
+  if(pass.length < 4){ err.textContent = 'Heslo musí mít alespoň 4 znaky.'; return; }
+
+  // ── Firebase cesta ──
+  if(window._fbSignIn){
+    btn.textContent = '...';
+    btn.disabled = true;
+    try {
+      await window._fbSignIn(email, pass);
+      // onAuthStateChanged zavolá _fbOnLogin automaticky
+    } catch(e) {
+      if(e.code === 'auth/user-not-found' || e.code === 'auth/invalid-credential'){
+        // Zkusíme registraci
+        try {
+          await window._fbSignUp(email, pass);
+        } catch(e2){
+          err.textContent = _fbErrMsg(e2.code);
+        }
+      } else {
+        err.textContent = _fbErrMsg(e.code);
+      }
+    } finally {
+      btn.textContent = 'Vstoupit →';
+      btn.disabled = false;
+    }
+    return;
+  }
+
+  // ── Lokální fallback cesta ──
+  function _hashPass(s){let h=0;for(let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i);h|=0;}return h.toString(36);}
+  const users = JSON.parse(localStorage.getItem('tl3_users')||'{}');
+  const hashed = _hashPass(pass);
+  if(users[email]){
+    if(users[email] !== hashed){ err.textContent = 'Špatné heslo.'; return; }
+  } else {
+    users[email] = hashed;
+    localStorage.setItem('tl3_users', JSON.stringify(users));
+  }
+  localStorage.setItem('tl3_session', email);
+  window._fbOnLogin({email});
+}
+
+function _fbErrMsg(code){
+  return ({
+    'auth/wrong-password':       'Špatné heslo.',
+    'auth/invalid-credential':   'Špatný email nebo heslo.',
+    'auth/email-already-in-use': 'Email je již registrován.',
+    'auth/too-many-requests':    'Příliš mnoho pokusů. Zkus to za chvíli.',
+    'auth/invalid-email':        'Neplatný email.',
+    'auth/network-request-failed':'Chyba sítě. Zkontroluj připojení.',
+  })[code] || ('Chyba: ' + code);
+}
+
+async function logoutApp(){
+  if(window._fbSignOut){
+    await window._fbSignOut();
+    // onAuthStateChanged zavolá _fbOnLogout automaticky
+  } else {
+    localStorage.removeItem('tl3_session');
+    window._fbOnLogout();
+  }
+}
+
+function loadDemoData(){
   trades=[
     {date:'2026-03-03',time:'09:15',asset:'EURUSD',type:'Forex',dir:'Long',tf:'H1',entry:1.08200,exit:1.08760,sl:1.07930,tp:1.09000,size:1,pipval:10,pnl:56.00,result:'Win',setup:'BOS',conf:'EMA200, S/R',mood:['Soustředěný'],rules:[],good:'Čekal jsem na close svíčky',bad:'',notes:'Čistý BOS na H1',prop:'FTMO',session:'London',rr:'2.07'},
     {date:'2026-03-05',time:'14:30',asset:'BTC',type:'Krypto',dir:'Long',tf:'H4',entry:83000,exit:81200,sl:82000,tp:87000,size:0.05,pipval:1,pnl:-90.00,result:'Loss',setup:'FVG',conf:'Orderblock',mood:['FOMO','Nervózní'],rules:['Čekat na potvrzení'],good:'',bad:'Vstoupil příliš brzy',notes:'FOMO trade',prop:'FTMO',session:'New York',rr:'4.00'},
@@ -442,22 +1801,39 @@ if(!trades.length){
     {date:'2026-04-22',time:'11:00',asset:'XAUUSD',type:'Komodity',dir:'Long',tf:'H4',entry:2300,exit:2340,sl:2280,tp:2380,size:0.1,pipval:10,pnl:40.00,result:'Win',setup:'BOS',conf:'HTF bullish, OB',mood:['Klidný','Soustředěný'],rules:[],good:'',bad:'',notes:'',prop:'',session:'London',rr:'4.00'},
   ];
 }
-if(!rules.length){
-  rules=['Nikdy neposouvat SL do ztráty','Čekat na potvrzení (close svíčky)','Max 3 obchody za den','Neobchodovat po sérii 2 ztrát','Nepřidávat pozici v ztrátě','Neobchodovat před NFP/news','Dodržet R:R min 1:2','Max risk 1% na obchod','Neobchodovat první 15 min seance'];
-}
-
 // ─── NAV ────────────────────────────────────────────
+const ALL_TABS = ['dashboard','trades','analytics','backtest','playbook','mistakes','tags','notes','accounts','settings','stats','new','journal','rules'];
+
 function nav(t){
-  document.querySelectorAll('.tab').forEach(el=>el.classList.remove('active'));
+  // Skryj všechny taby
+  ALL_TABS.forEach(id=>{
+    const el=document.getElementById('tab-'+id);
+    if(el){el.classList.remove('active');el.style.display='none';}
+  });
+  // Zobraz cílový tab
+  const tabEl=document.getElementById('tab-'+t);
+  if(tabEl){tabEl.classList.add('active');tabEl.style.display='block';}
+  // Aktivní stav v sidebaru (data-tab atribut)
   document.querySelectorAll('.nb').forEach(b=>b.classList.remove('active'));
-  document.getElementById('tab-'+t).classList.add('active');
-  const map={dashboard:0,stats:1,new:2,journal:3,rules:4};
-  if(map[t]!==undefined)document.querySelectorAll('.nb')[map[t]].classList.add('active');
-  if(t==='dashboard')renderDashboard();
-  if(t==='stats')renderStats();
-  if(t==='journal'){buildSetupFilter();renderJournal();}
-  if(t==='new'){setDef();renderRuleChips();}
-  if(t==='rules')renderRules();
+  const activeBtn=document.querySelector(`.nb[data-tab="${t}"]`);
+  if(activeBtn)activeBtn.classList.add('active');
+  // Render
+  const renders={
+    dashboard:  ()=>renderDashboard(),
+    trades:     ()=>renderTrades(),
+    analytics:  ()=>renderAnalytics(),
+    backtest:   ()=>{ loadBtData(); showBtView('sessions'); },
+    mistakes:   ()=>renderMistakes(),
+    tags:       ()=>renderTagsPage(),
+    notes:      ()=>renderNotes(),
+    accounts:   ()=>renderAccountsPage(),
+    settings:   ()=>renderSettings(),
+    stats:      ()=>renderStats(),
+    journal:    ()=>{buildSetupFilter();buildTagFilter();buildAccountFilter();renderJournal();},
+    new:        ()=>{setDef();renderRuleChips();buildAccountSelect();_tags=[];renderTagsInWrap('tag-input-wrap','tag-text');},
+    rules:      ()=>renderRules(),
+  };
+  if(renders[t]) renders[t]();
 }
 
 // ─── UTILS ──────────────────────────────────────────
@@ -543,7 +1919,7 @@ function renderRuleChips(){
   w.innerHTML=rules.map(r=>`<span class="chip" onclick="tr2(this,'${r.replace(/'/g,"\\'")}')">${r}</span>`).join('');
 }
 
-function saveTrade(){
+async function saveTrade(){
   const asset=document.getElementById('n-asset').value.trim();
   if(!asset){alert('Zadej aktivum!');return;}
 
@@ -557,7 +1933,6 @@ function saveTrade(){
   const type=document.getElementById('n-type').value;
 
   const rr=(entry&&sl&&tp)?calcRR(entry,sl,tp):null;
-
   let pnlManual=parseFloat(document.getElementById('n-pnl').value);
   let pnl;
   if(!isNaN(pnlManual)){pnl=r2(pnlManual);}
@@ -576,13 +1951,20 @@ function saveTrade(){
     setup:document.getElementById('n-setup').value,
     conf:document.getElementById('n-conf').value,
     mood:[...selMoods],rules:[...selRules],
+    tags:[..._tags],
+    account:document.getElementById('n-account').value||activeAccount,
     good:document.getElementById('n-good').value,
     bad:document.getElementById('n-bad').value,
     notes:document.getElementById('n-notes').value,
     prop:document.getElementById('n-prop').value,
     session:document.getElementById('n-session').value,
   });
-  save();clearForm();nav('dashboard');
+  // Přidej userId + accountId
+  const newTrade = trades[trades.length-1];
+  newTrade.userId    = window._fbCurrentUid || '';
+  newTrade.accountId = newTrade.account;
+  await saveTradeFb(newTrade);
+  clearForm();toast('✅ Obchod uložen');nav('journal');
 }
 
 function clearForm(){
@@ -597,8 +1979,15 @@ function clearForm(){
   renderRuleChips();
 }
 
-function deleteTrade(i){
-  if(confirm('Smazat obchod?')){trades.splice(i,1);save();renderJournal();renderDashboard();}
+async function deleteTrade(i){
+  if(confirm('Smazat obchod?')){
+    const trade = trades[i];
+    trades.splice(i,1);
+    await deleteTradeFb(trade);
+    closeModal('modal-detail');
+    renderJournal();renderDashboard();
+    toast('🗑 Obchod smazán','warn');
+  }
 }
 
 // ─── JOURNAL ─────────────────────────────────────────
@@ -611,7 +2000,9 @@ function buildSetupFilter(){
 }
 
 function clearFilters(){
-  ['f-type','f-result','f-dir','f-setup-f','f-session-f'].forEach(id=>document.getElementById(id).value='');
+  ['f-type','f-result','f-dir','f-setup-f','f-session-f','f-tag-f','f-account-f'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.value='';
+  });
   document.getElementById('f-search').value='';
   renderJournal();
 }
@@ -622,11 +2013,15 @@ function renderJournal(){
   const fd=document.getElementById('f-dir').value;
   const fs=document.getElementById('f-setup-f').value;
   const fse=document.getElementById('f-session-f').value;
+  const ftag=document.getElementById('f-tag-f')?.value||'';
+  const facc=document.getElementById('f-account-f')?.value||'';
   const fq=document.getElementById('f-search').value.toLowerCase();
 
   let list=trades.filter(t=>
     (!ft||t.type===ft)&&(!fr||t.result===fr)&&(!fd||t.dir===fd)&&
     (!fs||t.setup===fs)&&(!fse||t.session===fse)&&
+    (!ftag||(t.tags||[]).includes(ftag))&&
+    (!facc||t.account===facc)&&
     (!fq||t.asset.toLowerCase().includes(fq))
   ).slice().sort((a,b)=>{
     let av=a[sortCol],bv=b[sortCol];
@@ -643,7 +2038,8 @@ function renderJournal(){
   tbody.innerHTML=list.map(t=>{
     const i=trades.indexOf(t);
     const bc=t.result==='Win'?'bwin':t.result==='Loss'?'bloss':'bbe';
-    return `<tr>
+    const tagsHtml=(t.tags||[]).map(tg=>`<span class="tag" style="font-size:9px;padding:1px 6px;">${tg}</span>`).join('');
+    return `<tr onclick="openTradeDetail(${i})" data-idx="${i}">
       <td class="mono">${t.date}</td>
       <td style="font-weight:600">${t.asset}</td>
       <td><span class="badge btype">${t.type}</span></td>
@@ -656,20 +2052,22 @@ function renderJournal(){
       <td class="mono" style="color:${t.pnl>=0?'var(--green)':'var(--red)'};font-weight:600">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</td>
       <td class="mono" style="color:var(--text2)">${t.rr||'—'}</td>
       <td style="color:var(--text2);font-size:11px">${t.setup||'—'}</td>
+      <td>${tagsHtml||'<span style="color:var(--text3)">—</span>'}</td>
       <td style="color:var(--text3);font-size:11px">${t.session||'—'}</td>
       <td><span class="badge ${bc}">${t.result}</span></td>
-      <td style="color:var(--text3);font-size:11px">${(t.mood||[]).slice(0,2).join(', ')||'—'}</td>
-      <td><button class="del-btn" onclick="deleteTrade(${i})">✕</button></td>
+      <td onclick="event.stopPropagation()"><button class="del-btn" onclick="deleteTrade(${i})">✕</button></td>
     </tr>`;
   }).join('');
 }
 
 // ─── PERIOD FILTER ───────────────────────────────────
 function periodFilter(list){
+  // Nejdřív filtruj podle aktivního účtu
+  const byAcc = list.filter(t => !t.account || t.account===activeAccount);
   const v=document.getElementById('dash-period')?.value||'all';
-  if(v==='all')return list;
+  if(v==='all')return byAcc;
   const cutoff=new Date();cutoff.setDate(cutoff.getDate()-parseInt(v));
-  return list.filter(t=>new Date(t.date)>=cutoff);
+  return byAcc.filter(t=>new Date(t.date)>=cutoff);
 }
 
 // ─── DASHBOARD ───────────────────────────────────────
@@ -698,36 +2096,58 @@ function renderDashboard(){
   const avgRR=rrVals.length?r2(rrVals.reduce((a,b)=>a+b,0)/rrVals.length):null;
   let curS=0;for(let i=T.length-1;i>=0;i--){if(T[i].result==='Win')curS++;else break;}
 
+  // Account label
+  const activeAcc=accounts.find(a=>a.id===activeAccount);
+  const accLabel=document.getElementById('dash-account-label');
+  if(accLabel&&activeAcc) accLabel.innerHTML=`<span style="display:inline-flex;align-items:center;gap:5px;"><span style="width:6px;height:6px;border-radius:50%;background:${activeAcc.color};display:inline-block;"></span>${activeAcc.name}</span>`;
+
   document.getElementById('main-stats').innerHTML=`
-    <div class="sc" style="--sc-c:${totalPnl>=0?'var(--green)':'var(--red)'}">
-      <div class="sc-label">Celkový P&L</div>
-      <div class="sc-val" style="color:${totalPnl>=0?'var(--green)':'var(--red)'}">${totalPnl>=0?'+':''}${totalPnl.toFixed(2)}$</div>
-      <div class="sc-sub">${n} obchodů · ${wins.length}W ${losses.length}L ${bes.length}BE</div>
-    </div>
-    <div class="sc" style="--sc-c:var(--accent2)">
-      <div class="sc-label">Win rate</div>
-      <div class="sc-val" style="color:var(--accent2)">${wr}%</div>
-      <div class="sc-sub">Avg W: +${avgWin.toFixed(2)}$ | L: -${avgLoss.toFixed(2)}$</div>
-    </div>
-    <div class="sc" style="--sc-c:${pf>=1?'var(--green)':'var(--red)'}">
-      <div class="sc-label">Profit factor</div>
-      <div class="sc-val" style="color:${pf>=1?'var(--green)':'var(--red)'}">${isFinite(pf)?pf.toFixed(2):'∞'}</div>
-      <div class="sc-sub">+${grossP.toFixed(2)} / -${grossL.toFixed(2)}$</div>
-    </div>
-    <div class="sc" style="--sc-c:${exp>=0?'var(--green)':'var(--red)'}">
-      <div class="sc-label">Expectancy</div>
-      <div class="sc-val" style="color:${exp>=0?'var(--green)':'var(--red)'}">${exp>=0?'+':''}${exp.toFixed(2)}$</div>
-      <div class="sc-sub">Hodnota / obchod</div>
-    </div>
-    <div class="sc" style="--sc-c:var(--red)">
-      <div class="sc-label">Max Drawdown</div>
-      <div class="sc-val" style="color:var(--red)">-${maxDD.toFixed(2)}$</div>
-      <div class="sc-sub">Peak-to-trough</div>
-    </div>
-    <div class="sc" style="--sc-c:var(--accent)">
-      <div class="sc-label">Série výher</div>
-      <div class="sc-val" style="color:var(--accent)">${curS}</div>
-      <div class="sc-sub">Avg R:R: ${avgRR!==null?avgRR.toFixed(2):'—'}</div>
+    <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;margin-bottom:24px;">
+
+      <!-- Hero P&L card -->
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:24px 26px;position:relative;overflow:hidden;">
+        <div style="position:absolute;inset:0;background:radial-gradient(ellipse at top left,rgba(124,111,252,.06) 0%,transparent 60%);pointer-events:none;"></div>
+        <div style="font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:12px;">Total P&L</div>
+        <div style="font-size:38px;font-weight:700;font-family:var(--mono);letter-spacing:-1.5px;line-height:1;color:${totalPnl>=0?'var(--green)':'var(--red)'};">${totalPnl>=0?'+':''}${totalPnl.toFixed(2)}<span style="font-size:18px;margin-left:3px;opacity:.7;">$</span></div>
+        <div style="display:flex;gap:16px;margin-top:14px;">
+          <div><div style="font-size:10px;color:var(--text3);">Trades</div><div style="font-size:14px;font-weight:600;font-family:var(--mono);">${n}</div></div>
+          <div style="width:1px;background:var(--border);"></div>
+          <div><div style="font-size:10px;color:var(--text3);">Win</div><div style="font-size:14px;font-weight:600;font-family:var(--mono);color:var(--green);">${wins.length}</div></div>
+          <div style="width:1px;background:var(--border);"></div>
+          <div><div style="font-size:10px;color:var(--text3);">Loss</div><div style="font-size:14px;font-weight:600;font-family:var(--mono);color:var(--red);">${losses.length}</div></div>
+          <div style="width:1px;background:var(--border);"></div>
+          <div><div style="font-size:10px;color:var(--text3);">BE</div><div style="font-size:14px;font-weight:600;font-family:var(--mono);color:var(--text2);">${bes.length}</div></div>
+        </div>
+      </div>
+
+      <!-- Win Rate -->
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px 22px;">
+        <div style="font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;">Win Rate</div>
+        <div style="font-size:30px;font-weight:700;font-family:var(--mono);letter-spacing:-1px;color:var(--accent2);">${wr}<span style="font-size:16px;opacity:.7;">%</span></div>
+        <div style="margin-top:10px;height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;"><div style="height:100%;width:${wr}%;background:var(--accent2);border-radius:2px;transition:width .5s ease;"></div></div>
+        <div style="font-size:10px;color:var(--text3);margin-top:6px;">Avg W: +${avgWin.toFixed(0)}$ · L: -${avgLoss.toFixed(0)}$</div>
+      </div>
+
+      <!-- Profit Factor -->
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px 22px;">
+        <div style="font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;">Profit Factor</div>
+        <div style="font-size:30px;font-weight:700;font-family:var(--mono);letter-spacing:-1px;color:${pf>=1?'var(--green)':'var(--red)'};">${isFinite(pf)?pf.toFixed(2):'∞'}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:10px;">+${grossP.toFixed(0)}$ / -${grossL.toFixed(0)}$</div>
+      </div>
+
+      <!-- Avg R:R -->
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px 22px;">
+        <div style="font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;">Avg R:R</div>
+        <div style="font-size:30px;font-weight:700;font-family:var(--mono);letter-spacing:-1px;color:var(--accent);">${avgRR!==null?avgRR.toFixed(2):'—'}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:10px;">Expectancy ${exp>=0?'+':''}${exp.toFixed(2)}$</div>
+      </div>
+
+      <!-- Max DD -->
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px 22px;">
+        <div style="font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;">Max Drawdown</div>
+        <div style="font-size:30px;font-weight:700;font-family:var(--mono);letter-spacing:-1px;color:var(--red);">-${maxDD.toFixed(0)}<span style="font-size:16px;opacity:.7;">$</span></div>
+        <div style="font-size:10px;color:var(--text3);margin-top:10px;">Win streak: ${curS}</div>
+      </div>
     </div>
   `;
 
@@ -748,13 +2168,19 @@ function renderDashboard(){
   badge.textContent=(totalPnl>=0?'+':'')+totalPnl.toFixed(2)+'$';
   badge.style.color=totalPnl>=0?'var(--green)':'var(--red)';
 
-  // Donut
+  // Donut — bez built-in legendy, vlastní
   dch('wl');
   _ch['wl']=new Chart(document.getElementById('c-wl'),{
     type:'doughnut',
-    data:{labels:['Win','Loss','BE'],datasets:[{data:[wins.length,losses.length,bes.length],backgroundColor:['rgba(62,207,142,0.82)','rgba(255,77,79,0.82)','rgba(249,160,63,0.82)'],borderWidth:0}]},
-    options:{responsive:true,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:C.t,font:{size:11},padding:10,boxWidth:9}}}}
+    data:{labels:['Win','Loss','BE'],datasets:[{data:[wins.length,losses.length,bes.length],backgroundColor:['rgba(62,207,142,0.85)','rgba(240,79,80,0.85)','rgba(240,160,48,0.85)'],borderWidth:0,hoverBorderWidth:2,hoverBorderColor:'rgba(255,255,255,.1)'}]},
+    options:{responsive:true,cutout:'68%',plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${ctx.label}: ${ctx.parsed} trades`}}}}
   });
+  const wlLeg=document.getElementById('wl-legend');
+  if(wlLeg) wlLeg.innerHTML=`
+    <div style="display:flex;align-items:center;gap:5px;font-size:11px;"><span style="width:8px;height:8px;border-radius:50%;background:rgba(62,207,142,.85);flex-shrink:0;"></span><span style="color:var(--text2);">Win</span><span style="font-family:var(--mono);font-weight:600;color:var(--green);margin-left:4px;">${wins.length}</span></div>
+    <div style="display:flex;align-items:center;gap:5px;font-size:11px;"><span style="width:8px;height:8px;border-radius:50%;background:rgba(240,79,80,.85);flex-shrink:0;"></span><span style="color:var(--text2);">Loss</span><span style="font-family:var(--mono);font-weight:600;color:var(--red);margin-left:4px;">${losses.length}</span></div>
+    <div style="display:flex;align-items:center;gap:5px;font-size:11px;"><span style="width:8px;height:8px;border-radius:50%;background:rgba(240,160,48,.85);flex-shrink:0;"></span><span style="color:var(--text2);">BE</span><span style="font-family:var(--mono);font-weight:600;color:var(--accent3);margin-left:4px;">${bes.length}</span></div>
+  `;
 
   // Asset P&L
   const aMap={};T.forEach(t=>{aMap[t.asset]=r2((aMap[t.asset]||0)+t.pnl);});
@@ -778,38 +2204,64 @@ function renderDashboard(){
   dch('dist');
   _ch['dist']=new Chart(document.getElementById('c-dist'),{type:'bar',data:{labels:distL,datasets:[{data:counts,backgroundColor:bColors,borderRadius:4,borderSkipped:false}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{color:C.g},ticks:{color:C.t,font:{size:9},maxRotation:40}},y:{grid:{color:C.g},ticks:{color:C.t,font:{size:10},stepSize:1}}}}});
 
-  // Insights
+  // Insights — premium pill row
   const sortedT=T.slice().sort((a,b)=>b.pnl-a.pnl);
   const bestT=sortedT[0],worstT=sortedT[sortedT.length-1];
   const sMap2={};T.forEach(t=>{if(t.setup)sMap2[t.setup]=r2((sMap2[t.setup]||0)+t.pnl);});
   const topS=Object.keys(sMap2).sort((a,b)=>sMap2[b]-sMap2[a])[0]||'—';
   document.getElementById('insights').innerHTML=`
-    <div class="ins"><div class="ins-label">Nejlepší obchod</div><div class="ins-val" style="color:var(--green)">${bestT?'+'+ bestT.pnl.toFixed(2)+'$':'—'}</div><div class="ins-sub">${bestT?bestT.asset+' · '+bestT.date:''}</div></div>
-    <div class="ins"><div class="ins-label">Nejhorší obchod</div><div class="ins-val" style="color:var(--red)">${worstT?worstT.pnl.toFixed(2)+'$':'—'}</div><div class="ins-sub">${worstT?worstT.asset+' · '+worstT.date:''}</div></div>
-    <div class="ins"><div class="ins-label">Nejlepší setup</div><div class="ins-val" style="color:var(--accent)">${topS}</div><div class="ins-sub">${topS!=='—'?'+'+(sMap2[topS]||0).toFixed(2)+'$ celkem':''}</div></div>
-    <div class="ins"><div class="ins-label">Avg / obchod</div><div class="ins-val" style="color:${exp>=0?'var(--green)':'var(--red)'}">${exp>=0?'+':''}${exp.toFixed(2)}$</div><div class="ins-sub">Expectancy</div></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px;">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:6px;">Best Trade</div>
+        <div style="font-size:18px;font-weight:700;font-family:var(--mono);color:var(--green);">${bestT?'+'+bestT.pnl.toFixed(2)+'$':'—'}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:3px;font-family:var(--mono);">${bestT?bestT.asset+' · '+bestT.date:''}</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:6px;">Worst Trade</div>
+        <div style="font-size:18px;font-weight:700;font-family:var(--mono);color:var(--red);">${worstT?worstT.pnl.toFixed(2)+'$':'—'}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:3px;font-family:var(--mono);">${worstT?worstT.asset+' · '+worstT.date:''}</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:6px;">Best Setup</div>
+        <div style="font-size:18px;font-weight:700;font-family:var(--mono);color:var(--accent);">${topS}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:3px;font-family:var(--mono);">${topS!=='—'?'+'+(sMap2[topS]||0).toFixed(2)+'$ total':''}</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;">
+        <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:6px;">Expectancy</div>
+        <div style="font-size:18px;font-weight:700;font-family:var(--mono);color:${exp>=0?'var(--green)':'var(--red)'};">${exp>=0?'+':''}${exp.toFixed(2)}$</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:3px;">per trade</div>
+      </div>
+    </div>
   `;
 
-  // Recent 5
-  const rec=trades.slice().sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5);
-  document.getElementById('recent-tbody').innerHTML=rec.length?rec.map(t=>{
-    const bc=t.result==='Win'?'bwin':t.result==='Loss'?'bloss':'bbe';
-    return `<tr>
-      <td class="mono">${t.date}</td>
-      <td style="font-weight:600">${t.asset}</td>
-      <td><span class="badge ${t.dir==='Long'?'blong':'bshort'}">${t.dir}</span></td>
-      <td style="color:var(--text2);font-size:11px">${t.setup||'—'}</td>
-      <td class="mono" style="color:${t.pnl>=0?'var(--green)':'var(--red)'};font-weight:600">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</td>
-      <td class="mono" style="color:var(--text2)">${t.rr||'—'}</td>
-      <td><span class="badge ${bc}">${t.result}</span></td>
-      <td style="color:var(--text3);font-size:11px">${(t.mood||[]).slice(0,2).join(', ')||'—'}</td>
-    </tr>`;
-  }).join(''):`<tr><td colspan="8" class="empty" style="padding:20px;color:var(--text3);text-align:center">Žádné obchody</td></tr>`;
+  // Recent 5 — trade cards místo tabulky
+  const rec=periodFilter(trades).slice().sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5);
+  const recContainer=document.getElementById('recent-cards');
+  if(recContainer) recContainer.innerHTML=rec.length?rec.map(t=>{
+    const i=trades.indexOf(t);
+    const cls=t.result==='Win'?'win':t.result==='Loss'?'loss':'be';
+    const resultColor=t.result==='Win'?'var(--green)':t.result==='Loss'?'var(--red)':'var(--accent3)';
+    const leftBorder=t.result==='Win'?'var(--green)':t.result==='Loss'?'var(--red)':'var(--accent3)';
+    return `<div onclick="openTradeDetail(${i})" style="display:grid;grid-template-columns:3px 36px 1fr auto auto;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s;" onmouseover="this.style.background='rgba(255,255,255,.015)'" onmouseout="this.style.background='none'">
+      <div style="height:100%;background:${leftBorder};border-radius:2px;min-height:36px;align-self:stretch;"></div>
+      <div style="width:36px;height:36px;border-radius:9px;background:${t.dir==='Long'?'rgba(78,203,163,.1)':'rgba(240,79,80,.1)'};display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:${t.dir==='Long'?'var(--accent2)':'var(--red)'};">${t.dir==='Long'?'L':'S'}</div>
+      <div>
+        <div style="display:flex;align-items:center;gap:8px;"><span style="font-size:13px;font-weight:600;">${t.asset}</span>${t.setup?`<span style="font-size:10px;color:var(--text3);background:var(--bg3);padding:1px 7px;border-radius:5px;">${t.setup}</span>`:''}</div>
+        <div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:2px;">${t.date}${t.time?' · '+t.time:''}${t.session?' · '+t.session:''}</div>
+      </div>
+      <div style="text-align:right;">
+        <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:${resultColor};">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:1px;">R:R ${t.rr||'—'}</div>
+      </div>
+      <span style="font-size:10px;font-weight:600;padding:3px 8px;border-radius:6px;background:${t.result==='Win'?'rgba(62,207,142,.1)':t.result==='Loss'?'rgba(240,79,80,.1)':'rgba(240,160,48,.1)'};color:${resultColor};">${t.result}</span>
+    </div>`;
+  }).join('')+`<div style="padding:14px 20px;text-align:center;"><button class="btn btn-ghost" onclick="nav('trades')" style="font-size:11px;">View All Trades →</button></div>`
+  :'<div style="padding:40px;text-align:center;color:var(--text3);font-size:13px;">No trades yet. <button onclick="nav(\'new\')" class="btn btn-primary" style="margin-left:8px;font-size:12px;">Add your first trade</button></div>';
 }
 
 // ─── STATS ───────────────────────────────────────────
 function renderStats(){
-  const T=trades.slice().sort((a,b)=>a.date.localeCompare(b.date));
+  const T=accountTrades().slice().sort((a,b)=>a.date.localeCompare(b.date));
   const n=T.length;
   const wins=T.filter(t=>t.result==='Win');
   const losses=T.filter(t=>t.result==='Loss');
@@ -945,16 +2397,1009 @@ function renderRules(){
   `).join('');
 }
 
-function addRule(){
+async function addRule(){
   const inp=document.getElementById('rule-input');
   const v=inp.value.trim();if(!v)return;
-  rules.push(v);inp.value='';save();renderRules();
+  rules.push(v);inp.value='';await save();renderRules();
 }
-function deleteRule(i){if(confirm('Smazat pravidlo?')){rules.splice(i,1);save();renderRules();}}
+async function deleteRule(i){if(confirm('Smazat pravidlo?')){rules.splice(i,1);await save();renderRules();}}
+
+// ─── DETAIL TRADE ────────────────────────────────────
+function openTradeDetail(i){
+  const t=trades[i];
+  _editIdx=i;
+  const bc=t.result==='Win'?'bwin':t.result==='Loss'?'bloss':'bbe';
+  const accName=accounts.find(a=>a.id===t.account)?.name||t.account||'—';
+  document.getElementById('md-title').innerHTML=
+    `<span style="font-weight:700;font-size:15px;">${t.asset}</span>
+     <span class="badge ${t.dir==='Long'?'blong':'bshort'}" style="margin-left:8px;">${t.dir}</span>
+     <span class="badge ${bc}" style="margin-left:6px;">${t.result}</span>`;
+  document.getElementById('md-del-btn').onclick=()=>deleteTrade(i);
+  document.getElementById('md-body').innerHTML=`
+    <div class="td-grid">
+      <div class="td-cell"><div class="td-cell-label">Entry</div><div class="td-cell-val">${t.entry||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Exit</div><div class="td-cell-val">${t.exit||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Stop Loss</div><div class="td-cell-val" style="color:var(--red)">${t.sl||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Take Profit</div><div class="td-cell-val" style="color:var(--green)">${t.tp||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">P&L</div><div class="td-cell-val" style="color:${t.pnl>=0?'var(--green)':'var(--red)'}">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</div></div>
+      <div class="td-cell"><div class="td-cell-label">R:R</div><div class="td-cell-val" style="color:var(--accent)">${t.rr||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Velikost</div><div class="td-cell-val">${t.size}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Timeframe</div><div class="td-cell-val">${t.tf||'—'}</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+      <div class="td-cell"><div class="td-cell-label">Datum &amp; čas</div><div class="td-cell-val" style="font-size:13px">${t.date} ${t.time||''}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Setup</div><div class="td-cell-val" style="font-size:13px">${t.setup||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Session</div><div class="td-cell-val" style="font-size:13px">${t.session||'—'}</div></div>
+      <div class="td-cell"><div class="td-cell-label">Účet</div><div class="td-cell-val" style="font-size:13px">${accName}</div></div>
+    </div>
+    ${(t.tags||[]).length?`<div class="td-section"><div class="td-section-title">Tagy</div><div style="display:flex;flex-wrap:wrap;gap:5px;">${t.tags.map(tg=>`<span class="tag">${tg}</span>`).join('')}</div></div>`:''}
+    ${(t.mood||[]).length?`<div class="td-section"><div class="td-section-title">Mindset</div><div style="display:flex;flex-wrap:wrap;gap:5px;">${t.mood.map(m=>`<span class="chip" style="cursor:default">${m}</span>`).join('')}</div></div>`:''}
+    ${(t.rules||[]).length?`<div class="td-section"><div class="td-section-title">Porušená pravidla</div><div style="display:flex;flex-wrap:wrap;gap:5px;">${t.rules.map(r=>`<span class="chip rs" style="cursor:default">${r}</span>`).join('')}</div></div>`:''}
+    ${t.conf?`<div class="td-section"><div class="td-section-title">Confluences</div><div class="td-text">${t.conf}</div></div>`:''}
+    ${t.good?`<div class="td-section"><div class="td-section-title">Co fungovalo</div><div class="td-text" style="border-left:2px solid var(--green);padding-left:10px;">${t.good}</div></div>`:''}
+    ${t.bad?`<div class="td-section"><div class="td-section-title">Chyby</div><div class="td-text" style="border-left:2px solid var(--red);padding-left:10px;">${t.bad}</div></div>`:''}
+    ${t.notes?`<div class="td-section"><div class="td-section-title">Poznámky</div><div class="td-text">${t.notes}</div></div>`:''}
+  `;
+  openModal('modal-detail');
+  document.querySelectorAll('#journal-tbody tr').forEach(r=>r.classList.remove('selected'));
+  const row=document.querySelector(`#journal-tbody tr[data-idx="${i}"]`);
+  if(row)row.classList.add('selected');
+}
+
+function openEditFromDetail(){closeModal('modal-detail');openEditModal(_editIdx);}
+
+function openEditModal(i){
+  const t=trades[i]; _editIdx=i;
+  const accsOpts=accounts.map(a=>`<option value="${a.id}"${a.id===t.account?' selected':''}>${a.name}</option>`).join('');
+  document.getElementById('edit-body').innerHTML=`
+    <div class="fg" style="margin-bottom:10px;">
+      <div class="field"><label>Datum</label><input type="date" id="e-date" value="${t.date}"></div>
+      <div class="field"><label>Aktivum</label><input type="text" id="e-asset" value="${t.asset}"></div>
+      <div class="field"><label>Směr</label><select id="e-dir"><option${t.dir==='Long'?' selected':''}>Long</option><option${t.dir==='Short'?' selected':''}>Short</option></select></div>
+      <div class="field"><label>Výsledek</label><select id="e-result"><option${t.result==='Win'?' selected':''}>Win</option><option${t.result==='Loss'?' selected':''}>Loss</option><option${t.result==='Breakeven'?' selected':''}>Breakeven</option></select></div>
+    </div>
+    <div class="fg" style="margin-bottom:10px;">
+      <div class="field"><label>Entry</label><input type="number" id="e-entry" step="any" value="${t.entry||''}"></div>
+      <div class="field"><label>Exit</label><input type="number" id="e-exit" step="any" value="${t.exit||''}"></div>
+      <div class="field"><label>Stop Loss</label><input type="number" id="e-sl" step="any" value="${t.sl||''}"></div>
+      <div class="field"><label>Take Profit</label><input type="number" id="e-tp" step="any" value="${t.tp||''}"></div>
+      <div class="field"><label>Velikost</label><input type="number" id="e-size" step="any" value="${t.size||1}"></div>
+      <div class="field"><label>P&L ($)</label><input type="number" id="e-pnl" step="any" value="${t.pnl||0}"></div>
+    </div>
+    <div class="fg" style="margin-bottom:10px;">
+      <div class="field"><label>Setup</label><input type="text" id="e-setup" value="${t.setup||''}"></div>
+      <div class="field"><label>Session</label><select id="e-session">${['London','New York','Asian','London–NY Overlap','Pre-market','Jiná'].map(s=>`<option${t.session===s?' selected':''}>${s}</option>`).join('')}</select></div>
+      <div class="field"><label>Účet</label><select id="e-account"><option value="">—</option>${accsOpts}</select></div>
+    </div>
+    <div class="field" style="margin-bottom:10px;"><label>Tagy (čárkou oddělené)</label><input type="text" id="e-tags" value="${(t.tags||[]).join(', ')}" placeholder="A+, FOMO, Revenge..."></div>
+    <div class="fg2" style="margin-bottom:10px;">
+      <div class="field"><label>Co fungovalo</label><textarea id="e-good">${t.good||''}</textarea></div>
+      <div class="field"><label>Chyby</label><textarea id="e-bad">${t.bad||''}</textarea></div>
+    </div>
+    <div class="field"><label>Poznámky</label><textarea id="e-notes">${t.notes||''}</textarea></div>
+  `;
+  openModal('modal-edit');
+}
+
+async function saveEdit(){
+  if(_editIdx===null)return;
+  const t=trades[_editIdx];
+  const entry=parseFloat(document.getElementById('e-entry').value)||t.entry;
+  const exit=parseFloat(document.getElementById('e-exit').value)||t.exit;
+  const sl=parseFloat(document.getElementById('e-sl').value)||t.sl;
+  const tp=parseFloat(document.getElementById('e-tp').value)||t.tp;
+  const rr=(entry&&sl&&tp)?calcRR(entry,sl,tp):null;
+  const tagsRaw=document.getElementById('e-tags').value;
+  Object.assign(trades[_editIdx],{
+    date:document.getElementById('e-date').value,
+    asset:document.getElementById('e-asset').value.trim(),
+    dir:document.getElementById('e-dir').value,
+    result:document.getElementById('e-result').value,
+    entry:r4(entry),exit:r4(exit),sl:r4(sl),tp:r4(tp),
+    size:parseFloat(document.getElementById('e-size').value)||t.size,
+    pnl:r2(parseFloat(document.getElementById('e-pnl').value)||0),
+    rr:rr!==null?rr.toFixed(2):t.rr,
+    setup:document.getElementById('e-setup').value,
+    session:document.getElementById('e-session').value,
+    account:document.getElementById('e-account').value||t.account,
+    tags:tagsRaw?tagsRaw.split(',').map(x=>x.trim()).filter(Boolean):[],
+    good:document.getElementById('e-good').value,
+    bad:document.getElementById('e-bad').value,
+    notes:document.getElementById('e-notes').value,
+  });
+  await saveTradeFb(trades[_editIdx]);
+  closeModal('modal-edit');
+  buildTagFilter();renderJournal();renderDashboard();
+  toast('✏️ Obchod upraven','info');
+}
+
+// ─── ADVANCED ANALYTICS ──────────────────────────────
+function renderAnalytics(){
+  const T=accountTrades(); if(!T.length){document.getElementById('analytics-kpi').innerHTML='<div style="color:var(--text3);padding:20px">Žádné obchody pro tento účet.</div>';return;}
+  const rrVals=T.filter(t=>t.rr).map(t=>parseFloat(t.rr));
+  const avgRR=rrVals.length?r2(rrVals.reduce((a,b)=>a+b,0)/rrVals.length):0;
+  let maxWS=0,maxLS=0,curW=0,curL=0;
+  T.slice().sort((a,b)=>a.date.localeCompare(b.date)).forEach(t=>{
+    if(t.result==='Win'){curW++;maxWS=Math.max(maxWS,curW);curL=0;}
+    else if(t.result==='Loss'){curL++;maxLS=Math.max(maxLS,curL);curW=0;}
+    else{curW=0;curL=0;}
+  });
+  const dayMap={};T.forEach(t=>{dayMap[t.date]=r2((dayMap[t.date]||0)+t.pnl);});
+  const days=Object.entries(dayMap).sort((a,b)=>b[1]-a[1]);
+  const bestDay=days[0],worstDay=days[days.length-1];
+  document.getElementById('analytics-kpi').innerHTML=`
+    <div class="sc" style="--sc-c:var(--accent)"><div class="sc-label">Průměrný R:R</div><div class="sc-val" style="color:var(--accent)">${avgRR.toFixed(2)}</div><div class="sc-sub">${rrVals.length} obchodů s RR</div></div>
+    <div class="sc" style="--sc-c:var(--green)"><div class="sc-label">Max série výher</div><div class="sc-val" style="color:var(--green)">${maxWS}</div><div class="sc-sub">Za sebou</div></div>
+    <div class="sc" style="--sc-c:var(--red)"><div class="sc-label">Max série ztrát</div><div class="sc-val" style="color:var(--red)">${maxLS}</div><div class="sc-sub">Za sebou</div></div>
+    <div class="sc" style="--sc-c:var(--green)"><div class="sc-label">Nejlepší den</div><div class="sc-val" style="color:var(--green)">${bestDay?'+'+bestDay[1].toFixed(0)+'$':'—'}</div><div class="sc-sub">${bestDay?bestDay[0]:''}</div></div>
+    <div class="sc" style="--sc-c:var(--red)"><div class="sc-label">Nejhorší den</div><div class="sc-val" style="color:var(--red)">${worstDay?worstDay[1].toFixed(0)+'$':'—'}</div><div class="sc-sub">${worstDay?worstDay[0]:''}</div></div>
+  `;
+  function wrTable(groupFn,title,cid){
+    const map={};
+    T.forEach(t=>{const k=groupFn(t)||'—';if(!map[k])map[k]={w:0,l:0,be:0,pnl:0};map[k][t.result==='Win'?'w':t.result==='Loss'?'l':'be']++;map[k].pnl=r2(map[k].pnl+t.pnl);});
+    document.getElementById(cid).innerHTML=`<table class="analytics-table"><thead><tr><th>${title}</th><th>Obchodů</th><th>Win rate</th><th>P&L</th></tr></thead><tbody>
+      ${Object.entries(map).sort((a,b)=>b[1].pnl-a[1].pnl).map(([k,v])=>{
+        const tot=v.w+v.l+v.be,wr=tot?Math.round(v.w/tot*100):0;
+        return `<tr><td style="font-weight:500">${k}</td><td class="mono">${tot}</td><td><span style="color:${wr>=50?'var(--green)':'var(--red)'};font-family:var(--mono);font-weight:600">${wr}%</span></td><td class="mono" style="color:${v.pnl>=0?'var(--green)':'var(--red)'};font-weight:600">${v.pnl>=0?'+':''}${v.pnl.toFixed(2)}$</td></tr>`;
+      }).join('')}</tbody></table>`;
+  }
+  wrTable(t=>t.setup,'Setup','an-setup');
+  wrTable(t=>t.session,'Session','an-session');
+  wrTable(t=>t.asset,'Aktivum','an-asset');
+  let streaks=[],cur2=null,cnt=0;
+  T.slice().sort((a,b)=>a.date.localeCompare(b.date)).forEach(t=>{const r=t.result==='Win'?'W':t.result==='Loss'?'L':'B';if(r===cur2){cnt++;}else{if(cur2)streaks.push({type:cur2,count:cnt});cur2=r;cnt=1;}});
+  if(cur2)streaks.push({type:cur2,count:cnt});
+  document.getElementById('an-streaks').innerHTML=`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">${streaks.map(s=>`<span class="streak-badge ${s.type==='W'?'streak-win':'streak-loss'}">${s.type==='W'?'▲':'▼'} ${s.count}</span>`).join('<span style="color:var(--text3);font-size:10px;margin:0 2px;">→</span>')}</div>`;
+  document.getElementById('an-days').innerHTML=`<table class="analytics-table"><thead><tr><th>Datum</th><th>P&L</th><th>Obchodů</th></tr></thead><tbody>
+    ${days.slice(0,10).map(([d,pnl])=>`<tr><td class="mono">${d}</td><td class="mono" style="color:${pnl>=0?'var(--green)':'var(--red)'};font-weight:600">${pnl>=0?'+':''}${pnl.toFixed(2)}$</td><td class="mono">${T.filter(t=>t.date===d).length}</td></tr>`).join('')}
+  </tbody></table>`;
+}
+
+// ─── IMPORT MT5/MT4 ──────────────────────────────────
+let _importParsed = [];
+
+function openImport(){
+  _importParsed = [];
+  document.getElementById('import-preview').style.display = 'none';
+  document.getElementById('import-file-input').value = '';
+  openModal('modal-import');
+}
+
+function handleImportDrop(e){
+  e.preventDefault();
+  document.getElementById('import-dropzone').style.borderColor = 'var(--border2)';
+  document.getElementById('import-dropzone').style.background = '';
+  const file = e.dataTransfer.files[0];
+  if(file) handleImportFile(file);
+}
+
+function handleImportFile(file){
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e => parseImportData(e.target.result, file.name);
+  reader.readAsText(file, 'utf-8');
+}
+
+function parseImportData(content, filename){
+  _importParsed = [];
+  const isHTML = filename.toLowerCase().endsWith('.htm') || filename.toLowerCase().endsWith('.html');
+
+  if(isHTML){
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(content, 'text/html');
+    const rows = [...doc.querySelectorAll('tr')];
+    rows.forEach(row => {
+      const cells = [...row.querySelectorAll('td')].map(c => c.textContent.trim());
+      // MT5 HTML: Time | Deal | Symbol | Type | Direction | Volume | Price | Order | S/L | T/P | Profit | Balance
+      if(cells.length >= 10 && cells[2] && cells[2].length > 1 && !isNaN(parseFloat(cells[10]))){
+        _importParsed.push(_buildTradeFromMT5Row(cells));
+      }
+    });
+  } else {
+    // Detekuj oddělovač
+    const delim = content.split('\n')[0].includes(';') ? ';' : ',';
+    const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
+
+    // Přeskoč header řádek (neobsahuje čísla v prvním sloupci)
+    const dataLines = lines.filter(line => {
+      const firstCell = line.split(delim)[0].replace(/^"|"$/g,'').trim();
+      return /\d{4}[.\-\/]\d{2}[.\-\/]\d{2}/.test(firstCell) || /\d{2}[.\-\/]\d{2}[.\-\/]\d{4}/.test(firstCell);
+    });
+
+    dataLines.forEach(line => {
+      const cells = line.split(delim).map(c => c.replace(/^"|"$/g,'').trim());
+      if(cells.length < 8) return;
+      // MT5 CSV: Time | Deal | Symbol | Type | Direction | Volume | Price | Order | S/L | T/P | Profit | Balance
+      const profit = parseFloat(cells[10]);
+      if(cells[2] && cells[2].length > 1 && !isNaN(profit)){
+        _importParsed.push(_buildTradeFromMT5Row(cells));
+      }
+    });
+  }
+
+  // Odfiltruj duplicity (stejný asset + datum + pnl)
+  const seen = new Set(trades.map(t => `${t.date}_${t.asset}_${t.pnl}`));
+  _importParsed = _importParsed.filter(t => {
+    const key = `${t.date}_${t.asset}_${t.pnl}`;
+    if(seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  showImportPreview();
+}
+
+function _buildTradeFromMT5Row(cells){
+  // MT5 CSV/HTML sloupce:
+  // [0]=Time  [1]=Deal  [2]=Symbol  [3]=Type  [4]=Direction  [5]=Volume
+  // [6]=Price (entry)  [7]=Order  [8]=S/L  [9]=T/P  [10]=Profit  [11]=Balance
+
+  // Datum — MT5 používá "YYYY.MM.DD HH:MM:SS" nebo "DD.MM.YYYY HH:MM"
+  const dateRaw = (cells[0] || '').trim();
+  let date = new Date().toISOString().slice(0,10);
+  let time = '';
+  const isoMatch = dateRaw.match(/^(\d{4})[.\-\/](\d{2})[.\-\/](\d{2})/);
+  const euMatch  = dateRaw.match(/^(\d{2})[.\-\/](\d{2})[.\-\/](\d{4})/);
+  if(isoMatch)      { date = `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`; }
+  else if(euMatch)  { date = `${euMatch[3]}-${euMatch[2]}-${euMatch[1]}`; }
+  const timeMatch = dateRaw.match(/(\d{2}:\d{2})/);
+  if(timeMatch) time = timeMatch[1];
+
+  const asset   = (cells[2] || '').toUpperCase().trim();
+  const dirRaw  = (cells[4] || cells[3] || '').toLowerCase();
+  const dir     = (dirRaw.includes('buy') || dirRaw.includes('long')) ? 'Long' : 'Short';
+  const size    = parseFloat(cells[5]) || 1;
+  const entry   = parseFloat(cells[6]) || 0;
+  // exit cena — MT5 ji nedává přímo v history CSV; odhadneme z entry+pnl nebo necháme 0
+  const sl      = parseFloat(cells[8]) || 0;
+  const tp      = parseFloat(cells[9]) || 0;        // index 9 = T/P
+  const pnl     = r2(parseFloat(cells[10]) || 0);   // index 10 = Profit (opraveno z cells[9])
+  const result  = pnl > 0 ? 'Win' : pnl < 0 ? 'Loss' : 'Breakeven';
+
+  // Odhadni exit cenu z pnl pokud možné
+  let exit = 0;
+  if(entry && size && pnl !== 0){
+    // Forex aproximace (pip value ~10): exit = entry ± (pnl / (size * 10000))
+    const move = pnl / (size * 10);
+    exit = r4(dir === 'Long' ? entry + move * 0.0001 : entry - move * 0.0001);
+  }
+
+  // Typ aktiva
+  const sym = asset;
+  let type = 'Forex';
+  if(/BTC|ETH|BNB|SOL|XRP|ADA|DOT|LTC|LINK/i.test(sym)) type = 'Krypto';
+  else if(/XAU|GOLD|XAG|OIL|WTI|BRENT/i.test(sym))       type = 'Komodity';
+  else if(/SPX|NAS|DAX|US30|NDX|UK100|GER/i.test(sym))    type = 'Futures';
+  else if(sym.length <= 5 && !/USD|EUR|GBP|JPY|CHF|AUD|NZD|CAD/.test(sym)) type = 'Akcie';
+
+  return {
+    date, time, asset, type, dir, tf:'',
+    entry: r4(entry), exit: r4(exit), sl: r4(sl), tp: r4(tp),
+    size, pipval: 10, pnl,
+    rr: (entry && sl && tp) ? calcRR(entry, sl, tp)?.toFixed(2) || '' : '',
+    result, setup:'', conf:'', mood:[], rules:[], tags:['import'],
+    account: activeAccount,
+    good:'', bad:'', notes:'Importováno z MT5/MT4', prop:'', session:''
+  };
+}
+
+function showImportPreview(){
+  const preview = document.getElementById('import-preview');
+  const body    = document.getElementById('import-preview-body');
+  const count   = document.getElementById('import-count');
+  if(!_importParsed.length){
+    body.innerHTML = '<span style="color:var(--red)">Nepodařilo se načíst žádné obchody. Zkontroluj formát souboru (MT5/MT4 CSV nebo HTML report).</span>';
+    preview.style.display = 'block';
+    count.textContent = '';
+    return;
+  }
+  body.innerHTML = _importParsed.slice(0,8).map(t =>
+    `<span style="color:var(--text3)">${t.date}</span> &nbsp;<strong>${t.asset}</strong> &nbsp;`+
+    `<span class="badge ${t.dir==='Long'?'blong':'bshort'}" style="font-size:9px">${t.dir}</span> &nbsp;`+
+    `<span style="color:${t.pnl>=0?'var(--green)':'var(--red)'};">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</span>`
+  ).join('<br>') + (_importParsed.length > 8 ? `<br><span style="color:var(--text3)">... a ${_importParsed.length-8} dalších</span>` : '');
+  count.textContent = `Nalezeno ${_importParsed.length} obchodů`;
+  preview.style.display = 'block';
+}
+
+async function confirmImport(){
+  if(!_importParsed.length) return;
+  const count = _importParsed.length;
+
+  // Přidej userId + accountId ke každému importovanému trade
+  const uid = window._fbCurrentUid || '';
+  _importParsed.forEach(t=>{ t.userId=uid; t.accountId=t.account; });
+
+  // 1. Přidej do lokálního pole
+  trades.push(..._importParsed);
+
+  // 2. Ulož — Firebase batch nebo localStorage
+  if(uid && window._fbSaveAllTrades){
+    try{
+      await window._fbSaveAllTrades(uid, _importParsed);
+    } catch(e){
+      console.warn('Firestore import save failed, using localStorage:', e);
+      await save();
+    }
+  } else {
+    await save();
+  }
+
+  // 3. Resetuj buffer, zavři modal, naviguj
+  _importParsed = [];
+  closeModal('modal-import');
+  nav('journal');
+  renderDashboard();
+  toast(`📥 Importováno ${count} obchodů`);
+}
+
+// ─── DATA: PLAYBOOK, NOTES, MISTAKE TYPES ─────────────
+let playbook=[], notes=[], mistakeTypes=[];
+
+function loadExtras(){
+  try{playbook=JSON.parse(localStorage.getItem('tl3_playbook')||'[]');}catch(e){playbook=[];}
+  try{notes=JSON.parse(localStorage.getItem('tl3_notes')||'[]');}catch(e){notes=[];}
+  try{mistakeTypes=JSON.parse(localStorage.getItem('tl3_mistakeTypes')||'[]');}catch(e){mistakeTypes=[];}
+  if(!mistakeTypes.length) mistakeTypes=['FOMO','Early Entry','Late Entry','Moved SL','Overtrading','Revenge Trade','No Confirmation','Wrong Size'];
+}
+function saveExtras(){
+  localStorage.setItem('tl3_playbook',JSON.stringify(playbook));
+  localStorage.setItem('tl3_notes',JSON.stringify(notes));
+  localStorage.setItem('tl3_mistakeTypes',JSON.stringify(mistakeTypes));
+}
+
+// ─── TRADES TAB ───────────────────────────────────────
+function buildTradesFilters(){
+  const setups=[...new Set(accountTrades().map(t=>t.setup).filter(Boolean))].sort();
+  document.getElementById('tf-setup').innerHTML='<option value="">All Setups</option>'+setups.map(s=>`<option>${s}</option>`).join('');
+  const allTags=[...new Set(accountTrades().flatMap(t=>t.tags||[]))].sort();
+  document.getElementById('tf-tag').innerHTML='<option value="">All Tags</option>'+allTags.map(t=>`<option>${t}</option>`).join('');
+  document.getElementById('tf-account').innerHTML='<option value="">All Accounts</option>'+accounts.map(a=>`<option value="${a.id}">${a.name}</option>`).join('');
+}
+
+function clearTradesFilters(){
+  ['tf-result','tf-dir','tf-type','tf-setup','tf-session','tf-tag','tf-account'].forEach(id=>{
+    const el=document.getElementById(id);if(el)el.value='';
+  });
+  document.getElementById('tf-search').value='';
+  renderTrades();
+}
+
+function renderTrades(){
+  buildTradesFilters();
+  const fr=document.getElementById('tf-result').value;
+  const fd=document.getElementById('tf-dir').value;
+  const ft=document.getElementById('tf-type').value;
+  const fs=document.getElementById('tf-setup').value;
+  const fse=document.getElementById('tf-session').value;
+  const ftag=document.getElementById('tf-tag').value;
+  const facc=document.getElementById('tf-account').value;
+  const fq=document.getElementById('tf-search').value.toLowerCase();
+
+  let list=accountTrades().filter(t=>
+    (!fr||t.result===fr)&&(!fd||t.dir===fd)&&(!ft||t.type===ft)&&
+    (!fs||t.setup===fs)&&(!fse||t.session===fse)&&
+    (!ftag||(t.tags||[]).includes(ftag))&&
+    (!facc||t.account===facc)&&
+    (!fq||t.asset.toLowerCase().includes(fq))
+  ).sort((a,b)=>b.date.localeCompare(a.date));
+
+  // Summary
+  const n=list.length, wins=list.filter(t=>t.result==='Win').length;
+  const totalPnl=r2(list.reduce((s,t)=>s+t.pnl,0));
+  document.getElementById('trades-summary').innerHTML=`
+    <div class="sc" style="--sc-c:${totalPnl>=0?'var(--green)':'var(--red)'}"><div class="sc-label">P&L</div><div class="sc-val" style="color:${totalPnl>=0?'var(--green)':'var(--red)'}">${totalPnl>=0?'+':''}${totalPnl.toFixed(2)}$</div></div>
+    <div class="sc" style="--sc-c:var(--accent2)"><div class="sc-label">Trades</div><div class="sc-val" style="color:var(--accent2)">${n}</div></div>
+    <div class="sc" style="--sc-c:var(--green)"><div class="sc-label">Win Rate</div><div class="sc-val" style="color:var(--green)">${n?Math.round(wins/n*100):0}%</div></div>
+    <div class="sc" style="--sc-c:var(--accent)"><div class="sc-label">Avg R:R</div><div class="sc-val" style="color:var(--accent)">${(()=>{const v=list.filter(t=>t.rr).map(t=>parseFloat(t.rr));return v.length?r2(v.reduce((a,b)=>a+b,0)/v.length).toFixed(2):'—';})()}</div></div>
+  `;
+
+  const grid=document.getElementById('trades-grid');
+  const empty=document.getElementById('trades-empty');
+  if(!list.length){grid.innerHTML='';empty.style.display='block';return;}
+  empty.style.display='none';
+
+  grid.innerHTML=list.map((t,li)=>{
+    const i=trades.indexOf(t);
+    const cls=t.result==='Win'?'win':t.result==='Loss'?'loss':'be';
+    const tagsHtml=(t.tags||[]).map(tg=>`<span class="tag" style="font-size:9px;padding:1px 6px;">${tg}</span>`).join('');
+    const mistakesHtml=(t.rules||[]).map(m=>`<span style="font-size:9px;padding:1px 6px;background:rgba(255,77,79,.08);color:var(--red);border:1px solid rgba(255,77,79,.15);border-radius:20px;">${m}</span>`).join('');
+    return `<div class="trade-card ${cls}" onclick="openTradeDetail(${i})">
+      <div class="tc-dir ${t.dir==='Long'?'long':'short'}">${t.dir==='Long'?'L':'S'}</div>
+      <div>
+        <div class="tc-asset">${t.asset} <span style="font-size:10px;color:var(--text3);font-weight:400;">${t.type}</span></div>
+        <div class="tc-meta">${t.date} ${t.time||''} · ${t.tf||'—'} · ${t.session||'—'}</div>
+        <div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:4px;">${tagsHtml}${mistakesHtml}</div>
+      </div>
+      ${t.setup?`<span class="tc-setup">${t.setup}</span>`:'<span></span>'}
+      <div style="text-align:right;">
+        <div class="tc-pnl" style="color:${t.pnl>=0?'var(--green)':'var(--red)'}">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</div>
+        <div class="tc-rr">R:R ${t.rr||'—'}</div>
+      </div>
+      <span class="badge ${t.result==='Win'?'bwin':t.result==='Loss'?'bloss':'bbe'}">${t.result}</span>
+      <button class="del-btn" onclick="event.stopPropagation();deleteTrade(${i})" style="flex-shrink:0;">✕</button>
+    </div>`;
+  }).join('');
+}
+
+// ─── PLAYBOOK ────────────────────────────────────────
+function renderPlaybook(){
+  const grid=document.getElementById('playbook-grid');
+  const empty=document.getElementById('playbook-empty');
+  if(!playbook.length){grid.innerHTML='';empty.style.display='block';return;}
+  empty.style.display='none';
+  grid.innerHTML=playbook.map((s,i)=>{
+    const myTrades=accountTrades().filter(t=>t.setup===s.name);
+    const wins=myTrades.filter(t=>t.result==='Win').length;
+    const wr=myTrades.length?Math.round(wins/myTrades.length*100):0;
+    const pnl=r2(myTrades.reduce((sum,t)=>sum+t.pnl,0));
+    return `<div class="pb-card">
+      <div class="pb-card-header">
+        <div class="pb-card-name">${s.name}</div>
+        <span class="pb-card-type">${s.type||'Setup'}</span>
+      </div>
+      <div class="pb-card-desc">${s.desc||'<span style="color:var(--text3)">Bez popisu.</span>'}</div>
+      ${s.rules&&s.rules.length?`<div style="margin-bottom:12px;">${s.rules.map(r=>`<div style="font-size:11px;color:var(--text2);padding:2px 0;">• ${r}</div>`).join('')}</div>`:''}
+      <div class="pb-card-stats">
+        <div class="pb-stat"><div class="pb-stat-val">${myTrades.length}</div><div class="pb-stat-label">Trades</div></div>
+        <div class="pb-stat"><div class="pb-stat-val" style="color:${wr>=50?'var(--green)':'var(--red)'}">${wr}%</div><div class="pb-stat-label">Win Rate</div></div>
+        <div class="pb-stat"><div class="pb-stat-val" style="color:${pnl>=0?'var(--green)':'var(--red)'}">${pnl>=0?'+':''}${pnl.toFixed(0)}$</div><div class="pb-stat-label">P&L</div></div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:14px;border-top:1px solid var(--border);padding-top:12px;">
+        <button class="btn btn-ghost" style="font-size:11px;flex:1;" onclick="editSetup(${i})">Upravit</button>
+        <button class="del-btn" onclick="deleteSetup(${i})">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function openAddSetup(){
+  const name=prompt('Název setupu (např. BOS, FVG, SMC):');
+  if(!name||!name.trim())return;
+  const desc=prompt('Popis / podmínky vstupu:');
+  playbook.push({id:'pb_'+Date.now(),name:name.trim(),desc:desc||'',type:'Setup',rules:[]});
+  saveExtras();renderPlaybook();toast('✅ Setup přidán');
+}
+function editSetup(i){
+  const s=playbook[i];
+  const name=prompt('Název setupu:',s.name);if(!name)return;
+  const desc=prompt('Popis:',s.desc);
+  playbook[i]={...s,name:name.trim(),desc:desc||''};
+  saveExtras();renderPlaybook();toast('Setup upraven','info');
+}
+function deleteSetup(i){
+  if(!confirm('Smazat setup?'))return;
+  playbook.splice(i,1);saveExtras();renderPlaybook();toast('Setup smazán','warn');
+}
+
+// ─── MISTAKES ────────────────────────────────────────
+function renderMistakes(){
+  const T=accountTrades();
+  const mistakeMap={};
+  T.forEach(t=>(t.rules||[]).forEach(m=>{
+    if(!mistakeMap[m])mistakeMap[m]={count:0,pnl:0,wins:0};
+    mistakeMap[m].count++;
+    mistakeMap[m].pnl=r2(mistakeMap[m].pnl+t.pnl);
+    if(t.result==='Win')mistakeMap[m].wins++;
+  }));
+  const sorted=Object.entries(mistakeMap).sort((a,b)=>b[1].count-a[1].count);
+  const totalWithMistakes=T.filter(t=>(t.rules||[]).length>0).length;
+
+  document.getElementById('mistakes-kpi').innerHTML=`
+    <div class="sc" style="--sc-c:var(--red)"><div class="sc-label">Trades s chybou</div><div class="sc-val" style="color:var(--red)">${totalWithMistakes}</div><div class="sc-sub">${T.length?Math.round(totalWithMistakes/T.length*100):0}% ze všech</div></div>
+    <div class="sc" style="--sc-c:var(--accent3)"><div class="sc-label">Typy chyb</div><div class="sc-val" style="color:var(--accent3)">${sorted.length}</div></div>
+    <div class="sc" style="--sc-c:var(--red)"><div class="sc-label">Nejčastější</div><div class="sc-val" style="color:var(--red);font-size:14px;">${sorted[0]?sorted[0][0]:'—'}</div></div>
+    <div class="sc" style="--sc-c:var(--red)"><div class="sc-label">P&L z chyb</div><div class="sc-val" style="color:var(--red)">${r2(Object.values(mistakeMap).reduce((s,v)=>s+v.pnl,0)).toFixed(2)}$</div></div>
+  `;
+
+  // Chart
+  if(sorted.length){
+    const C={g:'rgba(255,255,255,0.04)',t:'#5a5e70'};
+    const id='mistakes-chart';
+    if(_ch[id]){_ch[id].destroy();delete _ch[id];}
+    _ch[id]=new Chart(document.getElementById(id),{
+      type:'bar',
+      data:{labels:sorted.map(([k])=>k),datasets:[{data:sorted.map(([,v])=>v.count),backgroundColor:'rgba(255,77,79,0.65)',borderRadius:4,borderSkipped:false}]},
+      options:{indexAxis:'y',responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{color:C.g},ticks:{color:C.t,font:{size:10}}},y:{grid:{color:C.g},ticks:{color:C.t,font:{size:10}}}}}
+    });
+  }
+
+  // By result table
+  document.getElementById('mistakes-by-result').innerHTML=sorted.length?`
+    <table class="analytics-table"><thead><tr><th>Mistake</th><th>Count</th><th>Win%</th><th>P&L</th></tr></thead><tbody>
+    ${sorted.map(([k,v])=>`<tr>
+      <td style="font-weight:500">${k}</td>
+      <td class="mono">${v.count}</td>
+      <td class="mono" style="color:${v.count&&Math.round(v.wins/v.count*100)>=50?'var(--green)':'var(--red)'}">${v.count?Math.round(v.wins/v.count*100):0}%</td>
+      <td class="mono" style="color:${v.pnl>=0?'var(--green)':'var(--red)'}">${v.pnl>=0?'+':''}${v.pnl.toFixed(2)}$</td>
+    </tr>`).join('')}</tbody></table>`:'<div style="color:var(--text3);font-size:12px">Žádné chyby zaznamenány.</div>';
+
+  // Trades with mistakes
+  const withMistakes=T.filter(t=>(t.rules||[]).length>0).sort((a,b)=>b.date.localeCompare(a.date));
+  document.getElementById('mistakes-tbody').innerHTML=withMistakes.map(t=>{
+    const i=trades.indexOf(t);
+    return `<tr style="cursor:pointer" onclick="openTradeDetail(${i})">
+      <td style="padding:9px 12px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;">${t.date}</td>
+      <td style="padding:9px 12px;border-bottom:1px solid var(--border);font-weight:600;">${t.asset}</td>
+      <td style="padding:9px 12px;border-bottom:1px solid var(--border);">${t.rules.map(m=>`<span style="font-size:10px;padding:1px 7px;background:rgba(255,77,79,.08);color:var(--red);border:1px solid rgba(255,77,79,.15);border-radius:20px;margin-right:3px;">${m}</span>`).join('')}</td>
+      <td style="padding:9px 12px;border-bottom:1px solid var(--border);font-family:var(--mono);font-weight:600;color:${t.pnl>=0?'var(--green)':'var(--red)'};">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}$</td>
+    </tr>`;
+  }).join('')||'<tr><td colspan="4" style="padding:20px;text-align:center;color:var(--text3)">Žádné chyby.</td></tr>';
+}
+
+// ─── TAGS PAGE ────────────────────────────────────────
+function renderTagsPage(){
+  const T=accountTrades();
+  const tagMap={};
+  T.forEach(t=>(t.tags||[]).forEach(tag=>{
+    if(!tagMap[tag])tagMap[tag]={count:0,pnl:0,wins:0};
+    tagMap[tag].count++;tagMap[tag].pnl=r2(tagMap[tag].pnl+t.pnl);
+    if(t.result==='Win')tagMap[tag].wins++;
+  }));
+  const sorted=Object.entries(tagMap).sort((a,b)=>b[1].count-a[1].count);
+  const colors=['#6c63ff','#4ecca3','#f9a03f','#ff4d4f','#3ecf8e','#e879f9','#38bdf8','#fb923c'];
+
+  document.getElementById('tags-overview').innerHTML=sorted.map(([tag,v],i)=>`
+    <div class="tag-card">
+      <div class="tag-card-dot" style="background:${colors[i%colors.length]}"></div>
+      <div class="tag-card-name">${tag}</div>
+      <div class="tag-card-count">${v.count} trades</div>
+      <div style="font-family:var(--mono);font-size:12px;color:${v.pnl>=0?'var(--green)':'var(--red)'};">${v.pnl>=0?'+':''}${v.pnl.toFixed(0)}$</div>
+    </div>
+  `).join('')||'<div style="color:var(--text3);font-size:13px;">Žádné tagy.</div>';
+
+  document.getElementById('tags-table-wrap').innerHTML=sorted.length?`
+    <table class="analytics-table"><thead><tr><th>Tag</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total P&L</th></tr></thead><tbody>
+    ${sorted.map(([tag,v])=>`<tr>
+      <td><span class="tag">${tag}</span></td>
+      <td class="mono">${v.count}</td>
+      <td class="mono" style="color:${Math.round(v.wins/v.count*100)>=50?'var(--green)':'var(--red)'}">${Math.round(v.wins/v.count*100)}%</td>
+      <td class="mono" style="color:${v.pnl/v.count>=0?'var(--green)':'var(--red)'}">${(v.pnl/v.count>=0?'+':'')}${r2(v.pnl/v.count).toFixed(2)}$</td>
+      <td class="mono" style="color:${v.pnl>=0?'var(--green)':'var(--red)'};">${v.pnl>=0?'+':''}${v.pnl.toFixed(2)}$</td>
+    </tr>`).join('')}</tbody></table>`
+  :'<div style="color:var(--text3);font-size:12px">Žádné tagy.</div>';
+}
+
+function openAddTag(){
+  const name=prompt('Nový tag:');if(!name||!name.trim())return;
+  toast(`Tag "${name.trim()}" přidej na trade v detailu.`,'info');
+}
+
+// ─── NOTES ───────────────────────────────────────────
+function renderNotes(){
+  const grid=document.getElementById('notes-grid');
+  const empty=document.getElementById('notes-empty');
+  if(!notes.length){grid.innerHTML='';empty.style.display='block';return;}
+  empty.style.display='none';
+  grid.innerHTML=notes.slice().reverse().map((n,ri)=>{
+    const i=notes.length-1-ri;
+    return `<div class="note-card">
+      <div class="note-card-date">${n.date||''} ${n.time||''}</div>
+      ${n.title?`<div class="note-card-title">${n.title}</div>`:''}
+      <div class="note-card-body">${n.body||''}</div>
+      <div class="note-card-footer">
+        ${n.tags?`<span class="tag" style="font-size:9px">${n.tags}</span>`:'<span></span>'}
+        <button class="del-btn" onclick="deleteNote(${i})">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function openAddNote(){
+  const title=prompt('Název poznámky (nepovinné):');
+  const body=prompt('Text poznámky:');
+  if(!body&&!title)return;
+  const now=new Date();
+  notes.push({id:'n_'+Date.now(),title:title||'',body:body||'',date:now.toISOString().slice(0,10),time:now.toTimeString().slice(0,5),tags:''});
+  saveExtras();renderNotes();toast('📝 Poznámka uložena');
+}
+function deleteNote(i){
+  if(!confirm('Smazat poznámku?'))return;
+  notes.splice(i,1);saveExtras();renderNotes();toast('Poznámka smazána','warn');
+}
+
+// ─── ACCOUNTS PAGE ────────────────────────────────────
+function renderAccountsPage(){
+  const grid=document.getElementById('accounts-page-grid');
+  grid.innerHTML=accounts.map((a,i)=>{
+    const myTrades=trades.filter(t=>t.account===a.id);
+    const wins=myTrades.filter(t=>t.result==='Win');
+    const pnl=r2(myTrades.reduce((s,t)=>s+t.pnl,0));
+    const wr=myTrades.length?Math.round(wins.length/myTrades.length*100):0;
+    const isActive=a.id===activeAccount;
+    return `<div class="acc-page-card ${isActive?'active-acc-card':''}">
+      <div class="acc-page-header">
+        <div class="acc-page-dot" style="background:${a.color}"></div>
+        <div class="acc-page-name">${a.name}</div>
+        ${isActive?'<span style="font-size:9px;font-weight:600;color:var(--accent);background:rgba(108,99,255,.1);padding:2px 8px;border-radius:20px;">Active</span>':''}
+      </div>
+      <div class="acc-page-stats">
+        <div class="acc-page-stat"><div class="acc-page-stat-label">Total P&L</div><div class="acc-page-stat-val" style="color:${pnl>=0?'var(--green)':'var(--red)'}">${pnl>=0?'+':''}${pnl.toFixed(2)}$</div></div>
+        <div class="acc-page-stat"><div class="acc-page-stat-label">Trades</div><div class="acc-page-stat-val">${myTrades.length}</div></div>
+        <div class="acc-page-stat"><div class="acc-page-stat-label">Win Rate</div><div class="acc-page-stat-val" style="color:${wr>=50?'var(--green)':'var(--red)'}">${wr}%</div></div>
+        <div class="acc-page-stat"><div class="acc-page-stat-label">Avg Trade</div><div class="acc-page-stat-val" style="color:${pnl/Math.max(myTrades.length,1)>=0?'var(--green)':'var(--red)'}">${myTrades.length?r2(pnl/myTrades.length).toFixed(2):'0.00'}$</div></div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:14px;border-top:1px solid var(--border);padding-top:12px;">
+        ${!isActive?`<button class="btn btn-ghost" style="flex:1;font-size:11px;" onclick="setActiveAccount('${a.id}');renderAccountsPage();renderSidebarAccounts();">Switch</button>`:'<div style="flex:1"></div>'}
+        <button class="btn btn-ghost" style="font-size:11px;" onclick="renameAccount(${i})">✏️ Rename</button>
+        ${accounts.length>1?`<button class="del-btn" onclick="deleteAccount(${i})">✕</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+  // Add account button
+  grid.innerHTML+=`<div style="background:var(--bg2);border:2px dashed var(--border);border-radius:var(--r);padding:20px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text3);font-size:13px;min-height:200px;" onclick="openAddAccountInline()" onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">+ Add Account</div>`;
+}
+
+function openAddAccountInline(){
+  const name=prompt('Název účtu (FTMO, Vlastní, For Traders...):');
+  if(!name||!name.trim())return;
+  const colors=['#6c63ff','#4ecca3','#f9a03f','#ff4d4f','#3ecf8e','#e879f9','#38bdf8'];
+  accounts.push({id:'acc_'+Date.now(),name:name.trim(),color:colors[accounts.length%colors.length]});
+  saveAccounts();renderAccountsPage();renderSidebarAccounts();buildAccountFilter();buildAccountSelect();toast('Account přidán');
+}
+
+// ─── SETTINGS ────────────────────────────────────────
+function renderSettings(){
+  // Rules v settings
+  const rEl=document.getElementById('settings-rules-list');
+  if(rEl) rEl.innerHTML=rules.length?rules.map((r,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);">
+      <div class="rule-num">${i+1}</div>
+      <div style="flex:1;font-size:12.5px;">${r}</div>
+      <button class="del-btn" onclick="deleteRule(${i})">✕</button>
+    </div>`).join(''):'<div style="color:var(--text3);font-size:12px;">Žádná pravidla.</div>';
+
+  // Mistake types v settings
+  const mEl=document.getElementById('mistakes-list');
+  if(mEl) mEl.innerHTML=mistakeTypes.map((m,i)=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border);">
+      <span style="flex:1;font-size:12.5px;">${m}</span>
+      <button class="del-btn" onclick="deleteMistakeType(${i})">✕</button>
+    </div>`).join('');
+
+  // Settings rule-input použije rule-input nebo settings-rule-input
+  const si=document.getElementById('settings-rule-input');
+  const ri=document.getElementById('rule-input');
+  if(si&&ri) si.oninput=()=>ri.value=si.value;
+}
+
+function addMistakeType(){
+  const inp=document.getElementById('mistake-input');
+  const v=inp.value.trim();if(!v)return;
+  if(!mistakeTypes.includes(v)) mistakeTypes.push(v);
+  inp.value='';saveExtras();renderSettings();
+  // Přidej do rule chips
+  renderRuleChips();
+  toast('Mistake type přidán');
+}
+function deleteMistakeType(i){
+  mistakeTypes.splice(i,1);saveExtras();renderSettings();
+}
+
+function confirmClearData(){
+  if(!confirm('POZOR: Smazat všechna data (trades, notes, playbook)? Tato akce je nevratná.'))return;
+  if(!confirm('Opravdu? Všechna data budou ztracena.'))return;
+  trades=[];rules=[];playbook=[];notes=[];
+  save();saveExtras();
+  renderDashboard();toast('Data smazána','error');
+}
+
+// ─── BACKTEST MODULE ──────────────────────────────────
+// Data — oddělené od live trades
+let btSessions = [];   // [{id, name, strategy, date, desc}]
+let btTrades   = [];   // [{id, sessionId, asset, dir, entry, sl, tp, exit, result, plannedRR, actualR, setup, strategy, session, mistakes, good, bad, notes, screenshot, date, tf}]
+let btStrategies = []; // ['SMC', 'ICT', 'Price Action', ...]
+
+function loadBtData(){
+  try{ btSessions   = JSON.parse(localStorage.getItem('tl3_btSessions')   || '[]'); }catch(e){ btSessions=[]; }
+  try{ btTrades     = JSON.parse(localStorage.getItem('tl3_btTrades')     || '[]'); }catch(e){ btTrades=[]; }
+  try{ btStrategies = JSON.parse(localStorage.getItem('tl3_btStrategies') || '[]'); }catch(e){ btStrategies=[]; }
+  if(!btStrategies.length) btStrategies = ['SMC', 'ICT', 'Price Action', 'Breakout', 'Mean Reversion'];
+}
+function saveBtData(){
+  localStorage.setItem('tl3_btSessions',   JSON.stringify(btSessions));
+  localStorage.setItem('tl3_btTrades',     JSON.stringify(btTrades));
+  localStorage.setItem('tl3_btStrategies', JSON.stringify(btStrategies));
+}
+
+// ── VIEW SWITCHER ─────────────────────────────────────
+function showBtView(v){
+  ['sessions','new','analytics'].forEach(id=>{
+    document.getElementById('bt-view-'+id).style.display = id===v ? 'block' : 'none';
+  });
+  ['sessions','new','analytics'].forEach(id=>{
+    const btn = document.getElementById('bt-tab-'+id);
+    if(!btn) return;
+    btn.style.background  = id===v ? 'var(--accent)' : '';
+    btn.style.color       = id===v ? '#fff' : '';
+    btn.style.borderColor = id===v ? 'var(--accent)' : '';
+  });
+  if(v==='sessions')  renderBtSessions();
+  if(v==='analytics') renderBtAnalytics();
+  if(v==='new')       { populateBtSessionSelect(); populateBtStrategySelect(); renderBtMistakeChips(); }
+}
+
+// ── SESSIONS ──────────────────────────────────────────
+function openNewSession(){
+  const name = prompt('Název session (např. "EUR strategie říjen"):');
+  if(!name||!name.trim()) return;
+  const strategy = prompt('Strategie / model (volitelné):') || '';
+  btSessions.push({ id:'bts_'+Date.now(), name:name.trim(), strategy, date:new Date().toISOString().slice(0,10), desc:'' });
+  saveBtData();
+  renderBtSessions();
+  toast('📋 Session vytvořena');
+}
+
+function deleteBtSession(id){
+  if(!confirm('Smazat session a všechny její trades?')) return;
+  btSessions = btSessions.filter(s=>s.id!==id);
+  btTrades   = btTrades.filter(t=>t.sessionId!==id);
+  saveBtData(); renderBtSessions();
+  toast('Session smazána','warn');
+}
+
+function renderBtSessions(){
+  // KPI přes všechny sessions
+  const n = btTrades.length;
+  const wins = btTrades.filter(t=>t.result==='Win').length;
+  const totalR = r2(btTrades.reduce((s,t)=>s+(parseFloat(t.actualR)||0),0));
+  const avgR = n ? r2(totalR/n) : 0;
+  document.getElementById('bt-kpi').innerHTML = `
+    <div class="sc" style="--sc-c:var(--accent)"><div class="sc-label">Total Sessions</div><div class="sc-val" style="color:var(--accent)">${btSessions.length}</div></div>
+    <div class="sc" style="--sc-c:var(--accent2)"><div class="sc-label">Total Trades</div><div class="sc-val" style="color:var(--accent2)">${n}</div></div>
+    <div class="sc" style="--sc-c:${wins/Math.max(n,1)>=.5?'var(--green)':'var(--red)'}"><div class="sc-label">Win Rate</div><div class="sc-val" style="color:${wins/Math.max(n,1)>=.5?'var(--green)':'var(--red)'}">${n?Math.round(wins/n*100):0}%</div></div>
+    <div class="sc" style="--sc-c:${totalR>=0?'var(--green)':'var(--red)'}"><div class="sc-label">Total R</div><div class="sc-val" style="color:${totalR>=0?'var(--green)':'var(--red)'}">${totalR>=0?'+':''}${totalR.toFixed(2)}R</div></div>
+    <div class="sc" style="--sc-c:var(--accent)"><div class="sc-label">Avg R / Trade</div><div class="sc-val" style="color:var(--accent)">${avgR>=0?'+':''}${avgR.toFixed(2)}R</div></div>
+  `;
+
+  const list = document.getElementById('bt-sessions-list');
+  const empty = document.getElementById('bt-sessions-empty');
+  if(!btSessions.length){ list.innerHTML=''; empty.style.display='block'; return; }
+  empty.style.display='none';
+  list.innerHTML = btSessions.slice().reverse().map(s=>{
+    const sTrades = btTrades.filter(t=>t.sessionId===s.id);
+    const sWins = sTrades.filter(t=>t.result==='Win').length;
+    const sR = r2(sTrades.reduce((sum,t)=>sum+(parseFloat(t.actualR)||0),0));
+    const wr = sTrades.length ? Math.round(sWins/sTrades.length*100) : 0;
+    return `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:16px 20px;display:grid;grid-template-columns:1fr auto auto auto auto;align-items:center;gap:16px;">
+      <div>
+        <div style="font-size:13px;font-weight:600;">${s.name}</div>
+        <div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:2px;">${s.date}${s.strategy?' · '+s.strategy:''}</div>
+      </div>
+      <div style="text-align:center;"><div style="font-size:10px;color:var(--text3);">Trades</div><div style="font-family:var(--mono);font-weight:600;">${sTrades.length}</div></div>
+      <div style="text-align:center;"><div style="font-size:10px;color:var(--text3);">Win%</div><div style="font-family:var(--mono);font-weight:600;color:${wr>=50?'var(--green)':'var(--red)'};">${wr}%</div></div>
+      <div style="text-align:center;"><div style="font-size:10px;color:var(--text3);">Total R</div><div style="font-family:var(--mono);font-weight:600;color:${sR>=0?'var(--green)':'var(--red)'};">${sR>=0?'+':''}${sR.toFixed(2)}R</div></div>
+      <div style="display:flex;gap:6px;">
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px;" onclick="showBtView('new');document.getElementById('bt-session-id').value='${s.id}'">+ Trade</button>
+        <button class="del-btn" onclick="deleteBtSession('${s.id}')">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── R-MULTIPLE VÝPOČET ────────────────────────────────
+function calcBtRR(){
+  const entry  = parseFloat(document.getElementById('bt-entry').value);
+  const sl     = parseFloat(document.getElementById('bt-sl').value);
+  const tp     = parseFloat(document.getElementById('bt-tp').value);
+  const exit   = parseFloat(document.getElementById('bt-exit').value);
+  const dir    = document.getElementById('bt-dir').value;
+
+  const risk = entry && sl ? Math.abs(entry - sl) : 0;
+
+  // Planned R:R
+  if(entry && sl && tp && risk>0){
+    const reward = Math.abs(tp - entry);
+    document.getElementById('bt-planned-rr').textContent = (reward/risk).toFixed(2)+'R';
+  } else {
+    document.getElementById('bt-planned-rr').textContent = '—';
+  }
+
+  // Actual R (výsledný násobek risku)
+  if(entry && sl && exit && risk>0){
+    const move = dir==='Long' ? exit-entry : entry-exit;
+    const actualR = r2(move/risk);
+    const el = document.getElementById('bt-actual-r');
+    el.textContent = (actualR>=0?'+':'')+actualR.toFixed(2)+'R';
+    el.style.color = actualR>=0 ? 'var(--green)' : 'var(--red)';
+  } else {
+    document.getElementById('bt-actual-r').textContent = '—';
+    document.getElementById('bt-actual-r').style.color = 'var(--text2)';
+  }
+}
+
+// ── FORM HELPERS ──────────────────────────────────────
+function populateBtSessionSelect(){
+  const sel = document.getElementById('bt-session-id');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— vybrat session —</option>' +
+    btSessions.map(s=>`<option value="${s.id}">${s.name}</option>`).join('');
+  if(cur) sel.value = cur;
+}
+function populateBtStrategySelect(){
+  const sel = document.getElementById('bt-strategy');
+  sel.innerHTML = '<option value="">— žádná —</option>' +
+    btStrategies.map(s=>`<option>${s}</option>`).join('');
+}
+function renderBtMistakeChips(){
+  const wrap = document.getElementById('bt-mistakes-chips');
+  if(!wrap) return;
+  const all = [...mistakeTypes];
+  wrap.innerHTML = all.map(m=>`
+    <span class="chip" onclick="this.classList.toggle('rs')" data-mistake="${m}">${m}</span>
+  `).join('');
+}
+
+// ── SAVE TRADE ────────────────────────────────────────
+function saveBtTrade(){
+  const sessionId = document.getElementById('bt-session-id').value;
+  const asset     = document.getElementById('bt-asset').value.trim();
+  if(!sessionId){ toast('Vyber session','error'); return; }
+  if(!asset)    { toast('Zadej symbol','error'); return; }
+
+  const entry = parseFloat(document.getElementById('bt-entry').value)||0;
+  const sl    = parseFloat(document.getElementById('bt-sl').value)||0;
+  const tp    = parseFloat(document.getElementById('bt-tp').value)||0;
+  const exit  = parseFloat(document.getElementById('bt-exit').value)||0;
+  const dir   = document.getElementById('bt-dir').value;
+  const risk  = entry&&sl ? Math.abs(entry-sl) : 0;
+  const plannedRR = (entry&&sl&&tp&&risk>0) ? r2(Math.abs(tp-entry)/risk) : null;
+  const actualR   = (entry&&sl&&exit&&risk>0) ? r2((dir==='Long'?exit-entry:entry-exit)/risk) : null;
+
+  // Vybrané mistakes
+  const selectedMistakes = [...document.querySelectorAll('#bt-mistakes-chips .chip.rs')].map(c=>c.dataset.mistake);
+
+  btTrades.push({
+    id:         'btt_'+Date.now(),
+    sessionId,
+    date:       document.getElementById('bt-date').value,
+    asset,
+    dir,
+    tf:         document.getElementById('bt-tf').value,
+    entry:      r4(entry), sl: r4(sl), tp: r4(tp), exit: r4(exit),
+    result:     document.getElementById('bt-result').value,
+    plannedRR:  plannedRR !== null ? plannedRR.toFixed(2) : '',
+    actualR:    actualR !== null ? actualR.toFixed(2) : '',
+    setup:      document.getElementById('bt-setup').value,
+    strategy:   document.getElementById('bt-strategy').value,
+    session:    document.getElementById('bt-mkt-session').value,
+    mistakes:   selectedMistakes,
+    good:       document.getElementById('bt-good').value,
+    bad:        document.getElementById('bt-bad').value,
+    notes:      document.getElementById('bt-notes').value,
+    screenshot: document.getElementById('bt-screenshot').value,
+  });
+  saveBtData();
+  clearBtForm();
+  toast('✅ Backtest trade uložen');
+  showBtView('sessions');
+}
+
+function clearBtForm(){
+  ['bt-asset','bt-entry','bt-sl','bt-tp','bt-exit','bt-setup','bt-good','bt-bad','bt-notes','bt-screenshot'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.value='';
+  });
+  document.getElementById('bt-planned-rr').textContent='—';
+  document.getElementById('bt-actual-r').textContent='—';
+  document.getElementById('bt-actual-r').style.color='var(--text2)';
+  document.querySelectorAll('#bt-mistakes-chips .chip').forEach(c=>c.classList.remove('rs'));
+}
+
+function deleteBtTrade(id){
+  if(!confirm('Smazat trade?')) return;
+  btTrades = btTrades.filter(t=>t.id!==id);
+  saveBtData(); renderBtAnalytics(); toast('Trade smazán','warn');
+}
+
+// ── ANALYTICS ─────────────────────────────────────────
+function renderBtAnalytics(){
+  const T = btTrades;
+  const n = T.length;
+  const wins   = T.filter(t=>t.result==='Win').length;
+  const losses = T.filter(t=>t.result==='Loss').length;
+  const totalR = r2(T.reduce((s,t)=>s+(parseFloat(t.actualR)||0),0));
+  const avgR   = n ? r2(totalR/n) : 0;
+  const rVals  = T.filter(t=>t.actualR).map(t=>parseFloat(t.actualR));
+  const maxDD  = (()=>{
+    let cum=0,peak=0,dd=0;
+    T.slice().sort((a,b)=>a.date.localeCompare(b.date)).forEach(t=>{ cum=r2(cum+(parseFloat(t.actualR)||0)); if(cum>peak)peak=cum; if(peak-cum>dd)dd=peak-cum; });
+    return r2(dd);
+  })();
+  const profitFactor = (()=>{
+    const gp=r2(T.filter(t=>parseFloat(t.actualR||0)>0).reduce((s,t)=>s+parseFloat(t.actualR),0));
+    const gl=r2(Math.abs(T.filter(t=>parseFloat(t.actualR||0)<0).reduce((s,t)=>s+parseFloat(t.actualR),0)));
+    return gl>0 ? r2(gp/gl) : (gp>0?Infinity:0);
+  })();
+
+  document.getElementById('bt-analytics-kpi').innerHTML=`
+    <div class="sc" style="--sc-c:${totalR>=0?'var(--green)':'var(--red)'}"><div class="sc-label">Total R</div><div class="sc-val" style="color:${totalR>=0?'var(--green)':'var(--red)'}">${totalR>=0?'+':''}${totalR.toFixed(2)}R</div></div>
+    <div class="sc" style="--sc-c:var(--accent2)"><div class="sc-label">Win Rate</div><div class="sc-val" style="color:var(--accent2)">${n?Math.round(wins/n*100):0}%</div><div class="sc-sub">${wins}W · ${losses}L</div></div>
+    <div class="sc" style="--sc-c:var(--accent)"><div class="sc-label">Avg R / Trade</div><div class="sc-val" style="color:var(--accent)">${avgR>=0?'+':''}${avgR.toFixed(2)}R</div></div>
+    <div class="sc" style="--sc-c:${profitFactor>=1?'var(--green)':'var(--red)'}"><div class="sc-label">Profit Factor</div><div class="sc-val" style="color:${profitFactor>=1?'var(--green)':'var(--red)'}">${isFinite(profitFactor)?profitFactor.toFixed(2):'∞'}</div></div>
+    <div class="sc" style="--sc-c:var(--red)"><div class="sc-label">Max Drawdown</div><div class="sc-val" style="color:var(--red)">-${maxDD.toFixed(2)}R</div></div>
+  `;
+
+  const C={g:'rgba(255,255,255,0.04)',t:'var(--text3)'};
+
+  // Equity curve v R
+  const sorted = T.slice().sort((a,b)=>a.date.localeCompare(b.date));
+  let cum=0; const eqD=sorted.map(t=>{cum=r2(cum+(parseFloat(t.actualR)||0));return cum;});
+  dch('bt-eq'); _ch['bt-eq']=new Chart(document.getElementById('bt-equity-chart'),{
+    type:'line',
+    data:{labels:sorted.map(t=>t.date.slice(5)),datasets:[{data:eqD,borderColor:totalR>=0?'var(--green)':'var(--red)',backgroundColor:totalR>=0?'rgba(62,207,142,.07)':'rgba(240,79,80,.07)',fill:true,tension:.4,pointRadius:2.5,borderWidth:2}]},
+    options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{color:C.g},ticks:{color:C.t,font:{size:10},maxTicksLimit:8}},y:{grid:{color:C.g},ticks:{color:C.t,font:{size:10},callback:v=>v+'R'}}}}
+  });
+
+  // R-Multiple distribution
+  const bins=[-3,-2,-1,-.5,0,.5,1,2,3];
+  const counts=new Array(bins.length-1).fill(0);
+  rVals.forEach(r=>{ for(let i=0;i<bins.length-1;i++){if(r>=bins[i]&&r<bins[i+1]){counts[i]++;break;}} });
+  dch('bt-r'); _ch['bt-r']=new Chart(document.getElementById('bt-r-chart'),{
+    type:'bar',
+    data:{labels:bins.slice(0,-1).map((b,i)=>`${b>=0?'+':''}${b}R`),datasets:[{data:counts,backgroundColor:counts.map((_,i)=>bins[i]>=0?'rgba(62,207,142,.7)':'rgba(240,79,80,.7)'),borderRadius:4,borderSkipped:false}]},
+    options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{grid:{color:C.g},ticks:{color:C.t,font:{size:10}}},y:{grid:{color:C.g},ticks:{color:C.t,font:{size:10},stepSize:1}}}}
+  });
+
+  // Win rate by setup
+  const setupMap={};
+  T.forEach(t=>{if(t.setup){if(!setupMap[t.setup])setupMap[t.setup]={w:0,n:0};setupMap[t.setup].n++;if(t.result==='Win')setupMap[t.setup].w++;}});
+  document.getElementById('bt-an-setup').innerHTML=Object.entries(setupMap).length?`
+    <table class="analytics-table"><thead><tr><th>Setup</th><th>Trades</th><th>Win Rate</th><th>Avg R</th></tr></thead><tbody>
+    ${Object.entries(setupMap).map(([s,v])=>{
+      const avgRs=r2(T.filter(t=>t.setup===s&&t.actualR).reduce((sum,t)=>sum+parseFloat(t.actualR),0)/Math.max(T.filter(t=>t.setup===s).length,1));
+      return `<tr><td style="font-weight:500">${s}</td><td class="mono">${v.n}</td><td class="mono" style="color:${v.w/v.n>=.5?'var(--green)':'var(--red)'}">${Math.round(v.w/v.n*100)}%</td><td class="mono" style="color:${avgRs>=0?'var(--green)':'var(--red)'}">${avgRs>=0?'+':''}${avgRs.toFixed(2)}R</td></tr>`;
+    }).join('')}</tbody></table>`
+  :'<div style="color:var(--text3);font-size:12px">Žádné setupy.</div>';
+
+  // Win rate by session
+  const sessMap={};
+  T.forEach(t=>{if(t.session){if(!sessMap[t.session])sessMap[t.session]={w:0,n:0};sessMap[t.session].n++;if(t.result==='Win')sessMap[t.session].w++;}});
+  document.getElementById('bt-an-session').innerHTML=Object.entries(sessMap).length?`
+    <table class="analytics-table"><thead><tr><th>Session</th><th>Trades</th><th>Win Rate</th></tr></thead><tbody>
+    ${Object.entries(sessMap).map(([s,v])=>`<tr><td style="font-weight:500">${s}</td><td class="mono">${v.n}</td><td class="mono" style="color:${v.w/v.n>=.5?'var(--green)':'var(--red)'}">${Math.round(v.w/v.n*100)}%</td></tr>`).join('')}
+    </tbody></table>`
+  :'<div style="color:var(--text3);font-size:12px">Žádné sessiony.</div>';
+
+  // Session review table
+  document.getElementById('bt-trades-tbody').innerHTML=sorted.slice().reverse().map(t=>`
+    <tr style="cursor:default;">
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;">${t.date}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-weight:600;">${t.asset}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);color:var(--text2);font-size:11px;">${t.setup||'—'}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--mono);">${t.plannedRR?t.plannedRR+'R':'—'}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--mono);font-weight:600;color:${parseFloat(t.actualR||0)>=0?'var(--green)':'var(--red)'};">${t.actualR?(parseFloat(t.actualR)>=0?'+':'')+t.actualR+'R':'—'}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);"><span class="badge ${t.result==='Win'?'bwin':t.result==='Loss'?'bloss':'bbe'}">${t.result}</span></td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);">${(t.mistakes||[]).map(m=>`<span style="font-size:9px;padding:1px 6px;background:rgba(240,79,80,.08);color:var(--red);border-radius:5px;margin-right:3px;">${m}</span>`).join('')||'—'}</td>
+      <td style="padding:10px 14px;border-bottom:1px solid var(--border);"><button class="del-btn" onclick="deleteBtTrade('${t.id}')">✕</button></td>
+    </tr>
+  `).join('')||'<tr><td colspan="8" style="padding:20px;text-align:center;color:var(--text3);">Žádné backtest trades.</td></tr>';
+}
+
+// ─── THEME SYSTEM ────────────────────────────────────
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  localStorage.setItem('tl3_theme', t);
+  _updateThemeButtons(t);
+}
+
+function _updateThemeButtons(t){
+  const dark  = document.getElementById('btn-dark');
+  const light = document.getElementById('btn-light');
+  if(!dark||!light) return;
+  const activeStyle  = 'background:var(--accent);color:#fff;';
+  const inactiveStyle= 'background:transparent;color:var(--text2);';
+  dark.style.cssText  += t==='dark'  ? activeStyle : inactiveStyle;
+  light.style.cssText += t==='light' ? activeStyle : inactiveStyle;
+}
+
+function initTheme(){
+  const saved = localStorage.getItem('tl3_theme') || 'dark';
+  setTheme(saved);
+}
 
 // ─── EXPORT CSV ──────────────────────────────────────
 function exportCSV(){
-  const cols=['date','time','asset','type','dir','tf','entry','exit','sl','tp','size','pipval','pnl','rr','result','setup','conf','prop','session','mood','rules','good','bad','notes'];
+  const cols=['date','time','asset','type','dir','tf','entry','exit','sl','tp','size','pipval','pnl','rr','result','setup','conf','tags','account','prop','session','mood','rules','good','bad','notes'];
   const hdr=cols.join(',');
   const rows=trades.map(t=>cols.map(c=>{
     let v=t[c];
@@ -967,10 +3412,6 @@ function exportCSV(){
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
   a.download='tradelog_'+new Date().toISOString().split('T')[0]+'.csv';a.click();
 }
-
-// ─── INIT ────────────────────────────────────────────
-setDef();
-renderDashboard();
 </script>
 </body>
 </html>
